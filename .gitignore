@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env
+.env
+.env.local
+.env*.local
+
+# Data (raw downloads + caches can be large / regenerable)
+data/raw/
+data/cache/
+data/processed/
+!data/raw/.gitkeep
+!data/cache/.gitkeep
+
+# Node / Next
+node_modules/
+.next/
+out/
+.vercel/
+next-env.d.ts
+*.tsbuildinfo
+
+# OS
+.DS_Store

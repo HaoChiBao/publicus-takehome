@@ -1,0 +1,19 @@
+# One-click API deploy on Render. The Next.js frontend deploys separately on Vercel.
+services:
+  - type: web
+    name: publicus-grants-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
