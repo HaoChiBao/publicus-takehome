@@ -2,11 +2,19 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, ExternalLink } from "lucide-react";
-import { api, type Award, type Program } from "@/lib/api";
+import { AlertTriangle, ArrowLeft, ExternalLink } from "lucide-react";
+import {
+  api,
+  type Award,
+  type OverlapFlag,
+  type Program,
+  type ReadinessResult,
+} from "@/lib/api";
 import { amountRange, formatCurrency, formatCurrencyFull } from "@/lib/format";
 import { sectorLabel } from "@/lib/constants";
+import ReadinessChecklist from "@/components/ReadinessChecklist";
 import RecipientTable from "@/components/RecipientTable";
+import WatchlistButton from "@/components/WatchlistButton";
 import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -21,17 +29,25 @@ export default function ProgramDetailPage({
   const [program, setProgram] = useState<Program | null>(null);
   const [awards, setAwards] = useState<Award[]>([]);
   const [total, setTotal] = useState(0);
+  const [readiness, setReadiness] = useState<ReadinessResult | null>(null);
+  const [overlapFlags, setOverlapFlags] = useState<OverlapFlag[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const session = localStorage.getItem("publicus_session");
     api
-      .programAwards(params.id, 500)
+      .programAwards(params.id, 200)
       .then((d) => {
         setProgram(d.program);
         setAwards(d.awards);
         setTotal(d.total);
       })
       .catch(() => setError("Program not found."));
+
+    if (session) {
+      api.programReadiness(params.id, session).then(setReadiness).catch(() => {});
+      api.programOverlap(params.id, session).then((d) => setOverlapFlags(d.flags)).catch(() => {});
+    }
   }, [params.id]);
 
   // Aggregate award analytics computed client-side from the award history.
@@ -119,16 +135,19 @@ export default function ProgramDetailPage({
                 {program.department}
               </p>
             </div>
-            {program.apply_url && (
-              <a
-                href={program.apply_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={buttonVariants()}
-              >
-                Apply <ExternalLink className="size-4" />
-              </a>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <WatchlistButton entityType="program" entityId={params.id} />
+              {program.apply_url && (
+                <a
+                  href={program.apply_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={buttonVariants()}
+                >
+                  Apply <ExternalLink className="size-4" />
+                </a>
+              )}
+            </div>
           </div>
 
           {program.description && (
@@ -175,6 +194,43 @@ export default function ProgramDetailPage({
           </div>
         </CardContent>
       </Card>
+
+      {overlapFlags.length > 0 && (
+        <div className="space-y-2">
+          {overlapFlags.map((flag) => (
+            <Card
+              key={flag.type}
+              className={
+                flag.severity === "warning"
+                  ? "border-amber-500/50 bg-amber-50/50 dark:bg-amber-950/20"
+                  : ""
+              }
+            >
+              <CardContent className="flex gap-3 p-4 text-sm">
+                <AlertTriangle
+                  className={
+                    flag.severity === "warning"
+                      ? "size-5 shrink-0 text-amber-600"
+                      : "size-5 shrink-0 text-muted-foreground"
+                  }
+                />
+                <div>
+                  <p className="font-medium">
+                    {flag.type === "sred_overlap"
+                      ? "SR&ED overlap"
+                      : flag.type === "sred_program"
+                        ? "SR&ED program"
+                        : "Tax credit note"}
+                  </p>
+                  <p className="mt-0.5 text-muted-foreground">{flag.message}</p>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {readiness && <ReadinessChecklist data={readiness} />}
 
       {/* Award analytics derived from history */}
       <div>

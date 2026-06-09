@@ -18,11 +18,19 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+async function del<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_URL}${path}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`DELETE ${path} -> ${res.status}`);
+  return res.json();
+}
+
 // ---- Types ----
 export interface MatchInfo {
   province: boolean;
   sector: boolean;
   size: boolean;
+  naics?: boolean;
+  activities?: boolean;
   hasHistory: boolean;
 }
 export interface Program {
@@ -38,10 +46,13 @@ export interface Program {
   eligible_sectors?: string[];
   eligible_sizes?: string[];
   eligible_activities?: string[];
+  eligible_naics_prefixes?: string[];
   deadline?: string | null;
   is_open?: boolean;
   apply_url?: string | null;
   last_updated?: string | null;
+  sred_related?: boolean;
+  tax_credit_type?: string | null;
   score?: number;
   match?: MatchInfo;
   match_reasons?: string[];
@@ -91,6 +102,12 @@ export interface RecipientHit {
   award_count: number;
   total_amount: number;
 }
+export interface PeerCompany extends RecipientHit {
+  similarity_score: number;
+  match_reasons: string[];
+  programs_in_common: string[];
+  primary_sector?: string;
+}
 export interface Profile {
   session_id: string;
   name?: string;
@@ -98,6 +115,34 @@ export interface Profile {
   province?: string;
   size_band?: string;
   activities?: string[];
+  naics_code?: string;
+}
+export interface DeadlineAlert {
+  program_id: string;
+  name: string;
+  deadline: string;
+  days_remaining: number;
+  urgency: "critical" | "warning" | "info";
+  apply_url?: string;
+}
+export interface ReadinessItem {
+  key: string;
+  label: string;
+  status: "pass" | "fail" | "partial" | "unknown";
+  required: boolean;
+  detail?: string;
+}
+export interface ReadinessResult {
+  readiness_score: number;
+  items: ReadinessItem[];
+  blockers: string[];
+  next_steps: string[];
+}
+export interface OverlapFlag {
+  type: string;
+  severity: "warning" | "info";
+  message: string;
+  related_programs?: { id: string; name: string; program_type?: string }[];
 }
 
 // ---- Endpoints ----
@@ -111,11 +156,75 @@ export const api = {
       matches: Program[];
       sector_summary: SectorSummary;
       trending: TrendingProgram[];
+      alerts: DeadlineAlert[];
+      peers: PeerCompany[];
     }>(`/api/dashboard/${sessionId}`),
+
+  exportDashboard: async (sessionId: string) => {
+    const res = await fetch(`${API_URL}/api/dashboard/${sessionId}/export`);
+    if (!res.ok) throw new Error("Export failed");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `publicus-grants-report-${sessionId.slice(0, 12)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
+  searchPrograms: (params: {
+    q?: string;
+    sector?: string;
+    province?: string;
+    size_band?: string;
+    program_type?: string;
+    is_open?: boolean;
+    activity?: string;
+    min_amount?: number;
+    max_amount?: number;
+    session_id?: string;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.sector) qs.set("sector", params.sector);
+    if (params.province) qs.set("province", params.province);
+    if (params.size_band) qs.set("size_band", params.size_band);
+    if (params.program_type) qs.set("program_type", params.program_type);
+    if (params.is_open !== undefined) qs.set("is_open", String(params.is_open));
+    if (params.activity) qs.set("activity", params.activity);
+    if (params.min_amount !== undefined) qs.set("min_amount", String(params.min_amount));
+    if (params.max_amount !== undefined) qs.set("max_amount", String(params.max_amount));
+    if (params.session_id) qs.set("session_id", params.session_id);
+    if (params.sort) qs.set("sort", params.sort);
+    if (params.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params.offset !== undefined) qs.set("offset", String(params.offset));
+    const query = qs.toString();
+    return get<{ programs: Program[]; total: number }>(
+      `/api/programs${query ? `?${query}` : ""}`
+    );
+  },
 
   programAwards: (id: string, limit = 25, offset = 0) =>
     get<{ program: Program; awards: Award[]; total: number }>(
       `/api/awards/program/${id}?limit=${limit}&offset=${offset}`
+    ),
+
+  programReadiness: (programId: string, sessionId: string) =>
+    get<ReadinessResult>(
+      `/api/programs/${programId}/readiness?session_id=${sessionId}`
+    ),
+
+  programOverlap: (programId: string, sessionId: string) =>
+    get<{ flags: OverlapFlag[] }>(
+      `/api/programs/${programId}/overlap?session_id=${sessionId}`
+    ),
+
+  naicsLookup: (q: string) =>
+    get<{ codes: { code: string; title: string; sector: string }[] }>(
+      `/api/programs/naics/lookup?q=${encodeURIComponent(q)}`
     ),
 
   searchRecipients: (q: string, province?: string) =>
@@ -123,6 +232,11 @@ export const api = {
       `/api/recipients/search?q=${encodeURIComponent(q)}${
         province ? `&province=${province}` : ""
       }`
+    ),
+
+  similarRecipients: (sessionId: string) =>
+    get<{ peers: PeerCompany[] }>(
+      `/api/recipients/similar?session_id=${sessionId}`
     ),
 
   recipientAwards: (id: string) =>
@@ -136,6 +250,20 @@ export const api = {
       awards: Award[];
       by_fiscal_year: { year: string; total: number; count: number }[];
     }>(`/api/recipients/${id}/awards`),
+
+  getWatchlist: (sessionId: string) =>
+    get<{ programs: Program[]; recipients: RecipientHit[] }>(
+      `/api/watchlist/${sessionId}`
+    ),
+
+  addWatchlist: (sessionId: string, entityType: "program" | "recipient", entityId: string) =>
+    post<{ ok: boolean }>(`/api/watchlist/${sessionId}`, {
+      entity_type: entityType,
+      entity_id: entityId,
+    }),
+
+  removeWatchlist: (sessionId: string, entityType: "program" | "recipient", entityId: string) =>
+    del<{ ok: boolean }>(`/api/watchlist/${sessionId}/${entityType}/${entityId}`),
 
   pipelineStatus: () =>
     get<{ runs: any[] }>("/api/pipeline/status"),

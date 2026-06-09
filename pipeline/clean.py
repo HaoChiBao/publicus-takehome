@@ -14,6 +14,9 @@ Steps:
 
 Output: data/processed/awards_clean.csv  (raw columns preserved alongside
 normalized ones) and a pipeline_runs row with per-issue counts.
+
+Large Open Canada downloads (1.9M+ rows) are processed in chunks with only the
+columns we need, so the stage fits in memory on a typical laptop.
 """
 from __future__ import annotations
 
@@ -25,11 +28,13 @@ import pandas as pd
 
 from utils import (
     PROCESSED_DIR, RAW_DIR,
-    dedup_hash, derive_fiscal_year, get_logger, log_pipeline_run,
-    normalize_department, normalize_province, parse_date,
+    dedup_hash, derive_fiscal_year, get_logger, iter_csv_chunks, log_pipeline_run,
+    normalize_department, normalize_province, parse_date, read_csv_file,
 )
 
 log = get_logger("pipeline.clean")
+
+CHUNK_SIZE = 100_000
 
 AGREEMENT_TYPE_MAP = {"g": "Grant", "c": "Contribution", "o": "Other"}
 
@@ -43,43 +48,138 @@ EXPECTED_COLS = [
     "description_en", "naics_identifier", "owner_org", "owner_org_title",
 ]
 
+# Live NRC-IRAP FTP exports use different headers than Open Canada (fixtures match OC).
+IRAP_COLUMN_MAP = {
+    "Reference Number": "ref_number",
+    "Amendment Number": "amendment_number",
+    "Agreement Type (English| FrenContribution|Contribution)": "agreement_type",
+    "Recipient Legal Name (English|French)": "recipient_legal_name",
+    "Recipient Operating Name (English|French)": "recipient_operating_name",
+    "Recipient Business Number": "recipient_business_number",
+    "Recipient Province or Territory": "recipient_province",
+    "Recipient City (English)": "recipient_city",
+    "Program Name (English)": "prog_name_en",
+    "Program Purpose (English)": "prog_purpose_en",
+    "Agreement Value in CAD": "agreement_value",
+    "Agreement Start Date": "agreement_start_date",
+    "Projected Agreement End Date": "agreement_end_date",
+    "Description (English)": "description_en",
+    "NAICS Identifier": "naics_identifier",
+}
+
+# Fixed output schema so Open Canada + IRAP rows append cleanly to the same CSV.
+AWARDS_CLEAN_COLS = [
+    *EXPECTED_COLS,
+    "source", "is_latest_amendment", "amount", "amount_flag",
+    "start_date", "end_date", "fiscal_year", "province", "department",
+    "dedup_hash", "is_cross_source_dup",
+    "recipient_name_raw", "program_name_raw", "city", "naics_code", "description",
+]
+
 
 def _latest_raw(prefix: str) -> Optional[Path]:
     files = sorted(RAW_DIR.glob(f"{prefix}*.csv"))
     return files[-1] if files else None
 
 
-def _read_source(path: Path, source: str) -> pd.DataFrame:
-    df = pd.read_csv(path, dtype=str, keep_default_na=False, na_values=[""])
-    for col in EXPECTED_COLS:
+def _source_paths() -> list[tuple[Path, str]]:
+    paths: list[tuple[Path, str]] = []
+    oc = _latest_raw("open_canada_grants_")
+    if oc:
+        paths.append((oc, "open_canada"))
+    for irap in sorted(RAW_DIR.glob("nrc_irap_*.csv")):
+        paths.append((irap, "nrc_irap"))
+    return paths
+
+
+def _is_irap(path: Path) -> bool:
+    return path.name.startswith("nrc_irap_")
+
+
+def _normalize_irap(chunk: pd.DataFrame) -> pd.DataFrame:
+    chunk = chunk.rename(columns=IRAP_COLUMN_MAP)
+    chunk["owner_org"] = "nrc-cnrc"
+    chunk["owner_org_title"] = "National Research Council"
+    return chunk
+
+
+def _iter_award_chunks(path: Path, source: str):
+    """Yield normalized award chunks with only EXPECTED_COLS populated."""
+    if _is_irap(path):
+        for chunk in iter_csv_chunks(path, chunksize=CHUNK_SIZE):
+            yield _prepare_chunk(_normalize_irap(chunk), source)
+    else:
+        for chunk in iter_csv_chunks(path, chunksize=CHUNK_SIZE, usecols=EXPECTED_COLS):
+            yield _prepare_chunk(chunk, source)
+
+
+def _build_max_amendments(paths: list[tuple[Path, str]]) -> dict[str, int]:
+    """Pass 1 — scan all sources for the max amendment_number per ref_number."""
+    max_by_ref: dict[str, int] = {}
+    for path, _source in paths:
+        if _is_irap(path):
+            cols = ["Reference Number", "Amendment Number"]
+            renames = {"Reference Number": "ref_number", "Amendment Number": "amendment_number"}
+        else:
+            cols = ["ref_number", "amendment_number"]
+            renames = {}
+        for chunk in iter_csv_chunks(path, chunksize=CHUNK_SIZE, usecols=cols):
+            if renames:
+                chunk = chunk.rename(columns=renames)
+            chunk["amendment_number"] = (
+                pd.to_numeric(chunk["amendment_number"], errors="coerce").fillna(0).astype(int)
+            )
+            has_ref = chunk["ref_number"].astype(str).str.strip() != ""
+            grouped = chunk.loc[has_ref].groupby("ref_number")["amendment_number"].max()
+            for ref, mx in grouped.items():
+                max_by_ref[ref] = max(max_by_ref.get(ref, 0), int(mx))
+    log.info("Latest-amendment index: %s distinct ref_numbers", len(max_by_ref))
+    return max_by_ref
+
+
+def _project_output(df: pd.DataFrame) -> pd.DataFrame:
+    for col in AWARDS_CLEAN_COLS:
         if col not in df.columns:
-            df[col] = None
-    df["source"] = source
-    log.info("Loaded %s rows from %s (source=%s)", len(df), path.name, source)
-    return df
+            df[col] = ""
+    return df[AWARDS_CLEAN_COLS]
+
+
+def _prepare_chunk(chunk: pd.DataFrame, source: str) -> pd.DataFrame:
+    for col in EXPECTED_COLS:
+        if col not in chunk.columns:
+            chunk[col] = ""
+    chunk["source"] = source
+    return chunk
 
 
 # ---------------------------------------------------------------------------
 # Step 1 — amendment deduplication
 # ---------------------------------------------------------------------------
-def step1_amendments(df: pd.DataFrame) -> pd.DataFrame:
+def step1_amendments(
+    df: pd.DataFrame, max_by_ref: Optional[dict[str, int]] = None,
+) -> pd.DataFrame:
     df["amendment_number"] = (
         pd.to_numeric(df["amendment_number"], errors="coerce").fillna(0).astype(int)
     )
-    df["is_latest_amendment"] = False
-    # Within each ref_number, the row with the max amendment number is "latest".
-    # Rows without a ref_number are each treated as their own latest.
-    has_ref = df["ref_number"].notna() & (df["ref_number"].astype(str).str.len() > 0)
-    idx_latest = (
-        df[has_ref]
-        .groupby("ref_number")["amendment_number"]
-        .idxmax()
-        .tolist()
-    )
-    df.loc[idx_latest, "is_latest_amendment"] = True
-    df.loc[~has_ref, "is_latest_amendment"] = True
+    has_ref = df["ref_number"].astype(str).str.strip() != ""
+    df["is_latest_amendment"] = True
+
+    if max_by_ref is not None:
+        df.loc[has_ref, "is_latest_amendment"] = (
+            df.loc[has_ref, "amendment_number"]
+            == df.loc[has_ref, "ref_number"].map(max_by_ref)
+        )
+    else:
+        idx_latest = (
+            df[has_ref]
+            .groupby("ref_number")["amendment_number"]
+            .idxmax()
+            .tolist()
+        )
+        df.loc[idx_latest, "is_latest_amendment"] = True
+        df.loc[~has_ref, "is_latest_amendment"] = True
+
     superseded = int((~df["is_latest_amendment"]).sum())
-    log.info("Step 1: flagged %s superseded amendment rows", superseded)
     return df
 
 
@@ -112,8 +212,6 @@ def step2_amounts(df: pd.DataFrame, issues: Counter) -> pd.DataFrame:
             issues[flag] += 1
     df["amount"] = amounts
     df["amount_flag"] = flags
-    log.info("Step 2: amount issues -> %s", {k: issues[k] for k in
-             ("null_amount", "zero_amount", "negative_amount", "unparseable_amount") if issues[k]})
     return df
 
 
@@ -135,7 +233,6 @@ def step3_dates(df: pd.DataFrame, issues: Counter) -> pd.DataFrame:
     df["fiscal_year"] = [
         derive_fiscal_year(parse_date(raw)) for raw in df["agreement_start_date"]
     ]
-    log.info("Step 3: bad_date=%s", issues["bad_date"])
     return df
 
 
@@ -150,7 +247,6 @@ def step4_provinces(df: pd.DataFrame, issues: Counter) -> pd.DataFrame:
             issues["unknown_province"] += 1
         out.append(code)
     df["province"] = out
-    log.info("Step 4: unknown_province=%s", issues["unknown_province"])
     return df
 
 
@@ -163,19 +259,27 @@ def step5_departments(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — dedup fingerprint + cross-source duplicate detection
+# Chunk transform (shared by fingerprint scan + final write)
 # ---------------------------------------------------------------------------
-def step6_fingerprint(df: pd.DataFrame, issues: Counter) -> pd.DataFrame:
-    df["dedup_hash"] = [
+def _transform_chunk(
+    chunk: pd.DataFrame,
+    max_by_ref: dict[str, int],
+    issues: Counter,
+    dup_hashes: set[str] | None = None,
+) -> pd.DataFrame:
+    chunk = step1_amendments(chunk, max_by_ref)
+    chunk = step2_amounts(chunk, issues)
+    chunk = step3_dates(chunk, issues)
+    chunk = step4_provinces(chunk, issues)
+    chunk = step5_departments(chunk)
+    chunk["dedup_hash"] = [
         dedup_hash(name, amt, sd)
-        for name, amt, sd in zip(df["recipient_legal_name"], df["amount"], df["start_date"])
+        for name, amt, sd in zip(chunk["recipient_legal_name"], chunk["amount"], chunk["start_date"])
     ]
-    counts = df["dedup_hash"].value_counts()
-    dup_hashes = set(counts[counts > 1].index)
-    df["is_cross_source_dup"] = df["dedup_hash"].isin(dup_hashes)
-    issues["cross_source_duplicate"] = int(df["is_cross_source_dup"].sum())
-    log.info("Step 6: cross_source_duplicate=%s", issues["cross_source_duplicate"])
-    return df
+    if dup_hashes is not None:
+        chunk["is_cross_source_dup"] = chunk["dedup_hash"].isin(dup_hashes)
+    out = _project_output(_finalize(chunk))
+    return out
 
 
 def _finalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -192,44 +296,68 @@ def _finalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def clean() -> pd.DataFrame:
-    frames = []
-    oc = _latest_raw("open_canada_grants_")
-    if oc:
-        frames.append(_read_source(oc, "open_canada"))
-    for irap in sorted(RAW_DIR.glob("nrc_irap_*.csv")):
-        frames.append(_read_source(irap, "nrc_irap"))
+def _collect_dup_hashes(
+    paths: list[tuple[Path, str]], max_by_ref: dict[str, int],
+) -> tuple[Counter, set[str]]:
+    """Pass 2 — scan sources in chunks to count fingerprint frequencies (no temp file)."""
+    hash_counts: Counter = Counter()
+    silent = Counter()
+    for path, source in paths:
+        log.info("Fingerprint scan: %s (source=%s)", path.name, source)
+        for chunk in _iter_award_chunks(path, source):
+            out = _transform_chunk(chunk, max_by_ref, silent)
+            hash_counts.update(out["dedup_hash"])
+    dup_hashes = {h for h, c in hash_counts.items() if c > 1}
+    return hash_counts, dup_hashes
 
-    if not frames:
+
+def clean() -> pd.DataFrame:
+    paths = _source_paths()
+    if not paths:
         raise FileNotFoundError(
-            "No raw award files found in data/raw/. Run ingest.py first "
-            "(USE_SAMPLE_DATA=1 for the offline fixtures)."
+            "No raw award files found in data/raw/. Run `python pipeline/ingest.py` first."
         )
 
-    df = pd.concat(frames, ignore_index=True)
-    records_raw = len(df)
     issues: Counter = Counter()
+    max_by_ref = _build_max_amendments(paths)
 
-    df = step1_amendments(df)
-    df = step2_amounts(df, issues)
-    df = step3_dates(df, issues)
-    df = step4_provinces(df, issues)
-    df = step5_departments(df)
-    df = step6_fingerprint(df, issues)
-    df = _finalize(df)
-
-    # "Clean" = rows we'd surface as a usable latest-amendment award with an amount.
-    records_clean = int((df["is_latest_amendment"] & df["amount"].notna()).sum())
-    records_skipped = records_raw - records_clean
+    hash_counts, dup_hashes = _collect_dup_hashes(paths, max_by_ref)
+    issues["cross_source_duplicate"] = sum(
+        c for h, c in hash_counts.items() if h in dup_hashes
+    )
+    log.info("Step 6: cross_source_duplicate=%s", issues["cross_source_duplicate"])
 
     out_path = PROCESSED_DIR / "awards_clean.csv"
-    df.to_csv(out_path, index=False)
-    log.info("Wrote %s cleaned rows -> %s", len(df), out_path)
+    tmp = PROCESSED_DIR / "awards_clean.tmp.csv"
+    for stale in (out_path, tmp, tmp.with_suffix(tmp.suffix + ".tmp")):
+        if stale.exists():
+            stale.unlink()
 
+    records_raw = 0
+    records_clean = 0
+    first = True
+    for path, source in paths:
+        log.info("Writing %s (source=%s) in %s-row chunks", path.name, source, CHUNK_SIZE)
+        for chunk in _iter_award_chunks(path, source):
+            out = _transform_chunk(chunk, max_by_ref, issues, dup_hashes)
+            records_raw += len(out)
+            records_clean += int((out["is_latest_amendment"] & out["amount"].notna()).sum())
+            out.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
+            first = False
+
+    log.info(
+        "Wrote %s cleaned rows -> %s (amount issues: %s, bad_date=%s, unknown_province=%s)",
+        records_raw, out_path,
+        {k: issues[k] for k in ("null_amount", "zero_amount", "negative_amount", "unparseable_amount") if issues[k]},
+        issues["bad_date"], issues["unknown_province"],
+    )
+
+    records_skipped = records_raw - records_clean
     log_pipeline_run(
         "open_canada:clean", records_raw, records_clean, records_skipped, dict(issues)
     )
-    return df
+    # Return a small head sample so callers/tests can inspect schema without OOM.
+    return read_csv_file(out_path, nrows=5)
 
 
 if __name__ == "__main__":

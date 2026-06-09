@@ -2,7 +2,8 @@
 
 Usage:
     python pipeline/run_all.py
-    USE_SAMPLE_DATA=1 python pipeline/run_all.py   # offline demo with fixtures
+    FORCE_INGEST=1 python pipeline/run_all.py   # re-download raw sources
+    SKIP_INGEST=1 python pipeline/run_all.py    # reuse cached data/raw files
 """
 from __future__ import annotations
 
@@ -13,13 +14,13 @@ import enrich
 import ingest
 import load
 import normalize_recipients
-from utils import USE_SAMPLE_DATA, get_logger
+from utils import get_logger
 
 log = get_logger("pipeline.run_all")
 
 
 async def main() -> None:
-    log.info("########## PIPELINE START (sample_mode=%s) ##########", USE_SAMPLE_DATA)
+    log.info("########## PIPELINE START ##########")
     ingest.main()
     clean.clean()
     await enrich.run()

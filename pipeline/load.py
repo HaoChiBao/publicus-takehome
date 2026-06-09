@@ -8,7 +8,7 @@ Connection: uses DATABASE_URL (asyncpg). A Supabase pooler URL works directly.
 A local JSON snapshot of every table is always written to data/processed/ so the
 load is inspectable and the frontend can be demoed without a live DB.
 
-Offline mode (USE_SAMPLE_DATA=1 or no DATABASE_URL): snapshot only, no DB writes.
+When DATABASE_URL is unset, writes a local JSON snapshot only (no DB writes).
 """
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ from typing import Any, Optional
 import pandas as pd
 
 from utils import (
-    PROCESSED_DIR, USE_SAMPLE_DATA, get_logger, log_pipeline_run,
+    PROCESSED_DIR, get_logger, iter_csv_chunks, log_pipeline_run,
+    read_csv_file,
 )
 
 log = get_logger("pipeline.load")
@@ -60,6 +61,16 @@ def _str(value: Any) -> Optional[str]:
     return s or None
 
 
+def _bbf_is_open(row: Any) -> bool:
+    status = _str(row.get("status")) or ""
+    if not status:
+        return True
+    lowered = status.lower()
+    if any(x in lowered for x in ("closed", "expired", "not available", "inactive")):
+        return False
+    return True
+
+
 def _loose_key(name: str) -> str:
     """Loose program key: drop parentheticals + punctuation for fuzzy joins.
 
@@ -77,10 +88,15 @@ def _loose_key(name: str) -> str:
 # Build relational records (with generated UUIDs + FK wiring)
 # ---------------------------------------------------------------------------
 def build_records() -> dict[str, list[dict]]:
-    awards_df = pd.read_csv(PROCESSED_DIR / "awards_clean.csv")
-    rec_df = pd.read_csv(PROCESSED_DIR / "recipients.csv")
+    awards_path = PROCESSED_DIR / "awards_clean.csv"
+    rec_df = read_csv_file(PROCESSED_DIR / "recipients.csv")
     prog_path = PROCESSED_DIR / "programs_enriched.csv"
-    prog_df = pd.read_csv(prog_path) if prog_path.exists() else pd.DataFrame()
+    prog_df = read_csv_file(prog_path) if prog_path.exists() else pd.DataFrame()
+
+    sector_map: dict[str, str] = {}
+    sector_map_path = PROCESSED_DIR / "program_sector_map.json"
+    if sector_map_path.exists():
+        sector_map = json.loads(sector_map_path.read_text(encoding="utf-8"))
 
     # --- recipients ---
     recipients, recipient_id_by_name = [], {}
@@ -98,13 +114,20 @@ def build_records() -> dict[str, list[dict]]:
         })
 
     # --- programs: derive eligible_sectors from award sectors on the same name ---
-    awards_df["_loose_prog"] = awards_df["program_name_raw"].fillna("").map(_loose_key)
+    # Read only columns needed for program-sector linkage (avoid loading all awards).
+    prog_sector_rows = []
+    for chunk in iter_csv_chunks(
+        awards_path, chunksize=100_000, usecols=["program_name_raw", "sector_normalized"],
+    ):
+        prog_sector_rows.append(chunk)
+    awards_prog = pd.concat(prog_sector_rows, ignore_index=True) if prog_sector_rows else pd.DataFrame()
+    awards_prog["_loose_prog"] = awards_prog["program_name_raw"].fillna("").map(_loose_key)
     sectors_by_prog = (
-        awards_df[awards_df["_loose_prog"] != ""]
+        awards_prog[awards_prog["_loose_prog"] != ""]
         .groupby("_loose_prog")["sector_normalized"]
         .agg(lambda s: sorted(set(x for x in s if isinstance(x, str))))
         .to_dict()
-    )
+    ) if len(awards_prog) else {}
     programs, program_id_by_norm, program_id_by_loose = [], {}, {}
     for _, p in prog_df.iterrows():
         pid = str(uuid.uuid4())
@@ -125,43 +148,49 @@ def build_records() -> dict[str, list[dict]]:
             "eligible_sectors": sectors_by_prog.get(_loose_key(name or "")) or [],
             "eligible_sizes": _as_list(p.get("eligible_sizes")),
             "eligible_activities": _as_list(p.get("eligible_activities")),
-            "deadline": None,
-            "is_open": True,
+            "deadline": _str(p.get("deadline")) or None,
+            "is_open": _bbf_is_open(p),
+            "sred_related": bool(p.get("sred_related")),
+            "tax_credit_type": _str(p.get("tax_credit_type")),
             "apply_url": _str(p.get("apply_url")),
             "last_updated": pd.Timestamp.now().date().isoformat(),
         })
 
-    # --- awards: wire recipient_id + best-effort program_id ---
+    # --- awards: wire recipient_id + best-effort program_id (chunked for large files) ---
     awards = []
-    for _, a in awards_df.iterrows():
-        canonical = _str(a.get("recipient_canonical"))
-        norm = _str(a.get("program_name_normalized")) or ""
-        pid = program_id_by_norm.get(norm) or program_id_by_loose.get(
-            _loose_key(_str(a.get("program_name_raw")) or "")
-        )
-        awards.append({
-            "id": str(uuid.uuid4()),
-            "source": _str(a.get("source")),
-            "ref_number": _str(a.get("ref_number")),
-            "amendment_number": int(a.get("amendment_number") or 0),
-            "is_latest_amendment": bool(a.get("is_latest_amendment")),
-            "recipient_id": recipient_id_by_name.get(canonical),
-            "recipient_name_raw": _str(a.get("recipient_name_raw")),
-            "department": _str(a.get("department")),
-            "program_name_raw": _str(a.get("program_name_raw")),
-            "program_name_normalized": norm or None,
-            "program_id": pid,
-            "agreement_type": _str(a.get("agreement_type")),
-            "amount": _num(a.get("amount")),
-            "province": _str(a.get("province")),
-            "city": _str(a.get("city")),
-            "naics_code": _str(a.get("naics_code")),
-            "sector_normalized": _str(a.get("sector_normalized")),
-            "fiscal_year": _str(a.get("fiscal_year")),
-            "start_date": _str(a.get("start_date")),
-            "end_date": _str(a.get("end_date")),
-            "description": _str(a.get("description")),
-        })
+    awards_path = PROCESSED_DIR / "awards_clean.csv"
+    for chunk in iter_csv_chunks(awards_path, chunksize=100_000):
+        for _, a in chunk.iterrows():
+            canonical = _str(a.get("recipient_canonical"))
+            prog_raw = _str(a.get("program_name_raw"))
+            norm = _str(a.get("program_name_normalized")) or (prog_raw or "").lower().strip()
+            sector = _str(a.get("sector_normalized")) or sector_map.get(prog_raw or "", "OTHER")
+            pid = program_id_by_norm.get(norm) or program_id_by_loose.get(
+                _loose_key(prog_raw or "")
+            )
+            awards.append({
+                "id": str(uuid.uuid4()),
+                "source": _str(a.get("source")),
+                "ref_number": _str(a.get("ref_number")),
+                "amendment_number": int(a.get("amendment_number") or 0),
+                "is_latest_amendment": bool(a.get("is_latest_amendment")),
+                "recipient_id": recipient_id_by_name.get(canonical),
+                "recipient_name_raw": _str(a.get("recipient_name_raw")),
+                "department": _str(a.get("department")),
+                "program_name_raw": prog_raw,
+                "program_name_normalized": norm or None,
+                "program_id": pid,
+                "agreement_type": _str(a.get("agreement_type")),
+                "amount": _num(a.get("amount")),
+                "province": _str(a.get("province")),
+                "city": _str(a.get("city")),
+                "naics_code": _str(a.get("naics_code")),
+                "sector_normalized": sector,
+                "fiscal_year": _str(a.get("fiscal_year")),
+                "start_date": _str(a.get("start_date")),
+                "end_date": _str(a.get("end_date")),
+                "description": _str(a.get("description")),
+            })
 
     return {"recipients": recipients, "grant_programs": programs, "grant_awards": awards}
 
@@ -242,15 +271,14 @@ async def run() -> None:
     records = build_records()
     write_snapshot(records)
 
-    has_db = bool(os.getenv("DATABASE_URL")) and not USE_SAMPLE_DATA
-    if has_db:
+    if os.getenv("DATABASE_URL"):
         try:
             await write_to_db(records)
         except Exception as e:  # noqa: BLE001
             log.error("DB load failed (%s). Snapshot is still available locally.", e)
             raise
     else:
-        log.info("No DATABASE_URL / offline mode — wrote local snapshot only.")
+        log.info("No DATABASE_URL — wrote local snapshot only.")
 
     log_pipeline_run(
         "load",

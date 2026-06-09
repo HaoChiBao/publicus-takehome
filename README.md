@@ -24,30 +24,48 @@ ways across hundreds of thousands of rows**. See
 [`pipeline/normalize_recipients.py`](pipeline/normalize_recipients.py) for the
 entity-resolution logic (blocking → fuzzy match → LLM confirmation → clustering).
 
-## Quick start (offline demo — no DB or API keys needed)
+## Quick start
 
-The pipeline ships with realistic sample fixtures and can run fully offline,
-writing a JSON snapshot that the API serves directly.
+The app downloads live federal grants data, cleans it, and serves it from
+`data/processed/db_*.json` (or Postgres when `DATABASE_URL` is set).
 
 ```bash
 # 1. Python deps
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env
 
-# 2. Run the whole pipeline against the bundled fixtures
-USE_SAMPLE_DATA=1 python pipeline/run_all.py
+# 2. Download + clean + load live data (first run downloads ~500MB Open Canada CSV)
+python pipeline/run_all.py
 #    -> writes data/processed/db_*.json
 
-# 3. Start the API (auto-detects no DATABASE_URL -> serves the JSON snapshot)
-cd api && uvicorn main:app --reload --port 8000
-#    -> http://localhost:8000/docs
+# Windows shortcut:
+# .\scripts\run_pipeline.ps1
+
+# 3. Start the API (serves the JSON snapshot when DATABASE_URL is unset)
+cd api && python -m uvicorn main:app --reload --port 8000
+#    -> http://localhost:8000/api/health  (check program count)
 
 # 4. Start the frontend (new terminal)
 cd frontend && cp .env.local.example .env.local && npm install && npm run dev
 #    -> http://localhost:3000
 ```
 
-## Full setup (Supabase + live data + LLM enrichment)
+Re-download raw sources: `FORCE_INGEST=1 python pipeline/run_all.py`  
+Reuse cached `data/raw/`: `SKIP_INGEST=1 python pipeline/run_all.py`
+
+### Manual download (if your network blocks automated downloads)
+
+Save these into `data/raw/` with any timestamped filename matching the patterns
+below, then run `SKIP_INGEST=1 python pipeline/run_all.py`:
+
+| Pattern | Source |
+|---------|--------|
+| `open_canada_grants_*.csv` | [Open Canada grants.csv](https://open.canada.ca/data/dataset/432527ab-7aac-45b5-81d6-7597107a7013/resource/1d15a62f-5656-49ad-8c88-f40ce689d831/download/grants.csv) (~500MB) |
+| `bbf_programs_*.xlsx` | [Business Benefits Finder dataset](https://open.canada.ca/data/en/dataset/business-benefits-finder) — latest XLSX |
+| `nrc_irap_202*_*.csv` | NRC IRAP fiscal-year CSVs from `ftp.maps.canada.ca` |
+
+## Production setup (Supabase + LLM enrichment)
 
 1. **Create a Supabase project** (free tier) and run
    [`supabase/schema.sql`](supabase/schema.sql) in the SQL editor.
@@ -57,10 +75,9 @@ cd frontend && cp .env.local.example .env.local && npm install && npm run dev
    - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` — for pipeline logging
    - `OPENAI_API_KEY` — enables real GPT-4o-mini enrichment (omit to use the
      deterministic heuristic fallbacks)
-3. **Run the pipeline against live sources** (downloads from Open Canada, CKAN,
-   and NRC-IRAP):
+3. **Run the pipeline** — downloads from Open Canada, CKAN, and NRC-IRAP:
    ```bash
-   python pipeline/run_all.py        # USE_SAMPLE_DATA unset / 0
+   python pipeline/run_all.py
    ```
 4. **Run the API** — with `DATABASE_URL` set it queries Postgres via asyncpg.
 
@@ -113,6 +130,7 @@ picks Postgres when `DATABASE_URL` is set.
 | `/program/[id]` | Program detail + structured eligibility + award history |
 | `/recipients` | Debounced recipient search |
 | `/recipients/[id]` | Full competitor grant history |
+| `/grants` | Browse all programs with filters + pagination |
 
 Key components: `MatchScore`, `SectorIntelCard` (hero with CSS bar chart + SVG
 sparkline), `RecipientTable` (sortable, paginated).
@@ -134,18 +152,16 @@ pipeline/   ingest · clean · enrich · normalize_recipients · load · utils �
 api/        main · db (Pg + Json repos) · routes/{programs,awards,recipients,pipeline,dashboard}
 frontend/   app/{page,dashboard,program/[id],recipients,recipients/[id]} · components · lib
 supabase/   schema.sql
-data/sample/  offline fixtures that exercise every cleaning branch
+data/raw/   downloaded source files (gitignored)
+data/processed/  cleaned snapshots consumed by the API (gitignored)
+scripts/    run_pipeline.ps1
 ```
 
 ## Notes & trade-offs
 
-- **Offline-first by design.** Sample fixtures + JSON-snapshot backend let the
-  whole stack run with no external dependencies, which doubles as a deterministic
-  test bed for the pipeline. The same code paths hit live sources / Postgres /
-  OpenAI when configured.
+- **Live data only.** The pipeline downloads Open Canada grants, the Business
+  Benefits Finder program catalogue (~1,500 programs), and NRC-IRAP CSVs.
 - **Heuristic fallbacks** for both LLM steps keep the pipeline runnable without an
   OpenAI key; with a key, the GPT-4o-mini paths take over and results are cached.
-- The in-memory `JsonRepository` is for the prototype/demo; production traffic
-  goes through `PgRepository` and SQL so it scales with the full Open Canada
-  dataset.
-```
+- The in-memory `JsonRepository` serves the local JSON snapshot for development;
+  production traffic goes through `PgRepository` and SQL.

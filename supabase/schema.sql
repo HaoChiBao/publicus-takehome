@@ -35,8 +35,11 @@ CREATE TABLE IF NOT EXISTS grant_programs (
   eligible_sectors    TEXT[],
   eligible_sizes      TEXT[],         -- ['1-10','11-50','51-200','200+']
   eligible_activities TEXT[],         -- ['R&D','Export','Hiring','Digital Transformation']
+  eligible_naics_prefixes TEXT[],
   deadline            DATE,
   is_open             BOOLEAN DEFAULT true,
+  sred_related        BOOLEAN DEFAULT false,
+  tax_credit_type     TEXT,
   apply_url           TEXT,
   last_updated        DATE,
   created_at          TIMESTAMPTZ DEFAULT now()
@@ -87,8 +90,20 @@ CREATE TABLE IF NOT EXISTS company_profiles (
   province    CHAR(2),
   size_band   TEXT,           -- '1-10' | '11-50' | '51-200' | '200+'
   activities  TEXT[],
+  naics_code  TEXT,
   created_at  TIMESTAMPTZ DEFAULT now()
 );
+
+-- Saved programs / competitors per session (no auth)
+CREATE TABLE IF NOT EXISTS watchlist_items (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id   TEXT NOT NULL,
+  entity_type  TEXT NOT NULL CHECK (entity_type IN ('program', 'recipient')),
+  entity_id    UUID NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (session_id, entity_type, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_session ON watchlist_items(session_id);
 
 -- ---------------------------------------------------------------------------
 -- Pipeline run logs

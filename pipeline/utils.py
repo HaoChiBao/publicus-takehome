@@ -13,7 +13,7 @@ import os
 import re
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from dotenv import load_dotenv
 
@@ -27,12 +27,14 @@ DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 CACHE_DIR = DATA_DIR / "cache"
 PROCESSED_DIR = DATA_DIR / "processed"
-SAMPLE_DIR = DATA_DIR / "sample"
 
-for _d in (RAW_DIR, CACHE_DIR, PROCESSED_DIR, SAMPLE_DIR):
+for _d in (RAW_DIR, CACHE_DIR, PROCESSED_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-USE_SAMPLE_DATA = os.getenv("USE_SAMPLE_DATA", "0") == "1"
+
+def requests_verify() -> bool:
+    """Whether HTTPS downloads should verify TLS certificates."""
+    return os.getenv("SSL_VERIFY", "1") != "0"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,6 +56,87 @@ log = get_logger("pipeline.utils")
 def timestamp() -> str:
     """Filesystem-friendly timestamp, e.g. 20240605_171930."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# Encodings seen across Canadian open-data exports (Open Canada = UTF-8; IRAP FTP = cp1252).
+CSV_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+
+
+def read_csv_file(path: Path, **kwargs: Any):
+    """Read a CSV, trying common encodings used by federal open-data sources."""
+    import pandas as pd
+
+    opts = _csv_read_kwargs(kwargs)
+    last_err: UnicodeDecodeError | None = None
+    for encoding in CSV_ENCODINGS:
+        try:
+            df = pd.read_csv(path, encoding=encoding, **opts)
+            if encoding not in {"utf-8", "utf-8-sig"}:
+                log.info("Read %s with encoding %s", path.name, encoding)
+            return df
+        except UnicodeDecodeError as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    raise UnicodeDecodeError("unknown", b"", 0, 0, "unable to decode CSV")
+
+
+def _csv_read_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    opts = dict(kwargs)
+    opts.setdefault("dtype", str)
+    opts.setdefault("keep_default_na", False)
+    opts.setdefault("na_values", [""])
+    opts.setdefault("low_memory", False)
+    return opts
+
+
+def iter_csv_chunks(path: Path, chunksize: int = 100_000, **kwargs: Any):
+    """Yield chunks from a large CSV without loading the whole file into memory."""
+    import pandas as pd
+
+    opts = _csv_read_kwargs(kwargs)
+    last_err: UnicodeDecodeError | None = None
+    for encoding in CSV_ENCODINGS:
+        try:
+            reader = pd.read_csv(
+                path, encoding=encoding, chunksize=chunksize, **opts,
+            )
+            for chunk in reader:
+                yield chunk
+            if encoding not in {"utf-8", "utf-8-sig"}:
+                log.info("Read %s in chunks with encoding %s", path.name, encoding)
+            return
+        except UnicodeDecodeError as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    raise UnicodeDecodeError("unknown", b"", 0, 0, "unable to decode CSV")
+
+
+def rewrite_csv_in_chunks(
+    path: Path,
+    transform: Callable[[Any], Any],
+    chunksize: int = 100_000,
+    **read_kwargs: Any,
+) -> int:
+    """Apply a transform to each chunk and atomically replace the source CSV."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    total = 0
+    first = True
+    try:
+        for chunk in iter_csv_chunks(path, chunksize=chunksize, **read_kwargs):
+            out = transform(chunk)
+            out.to_csv(tmp, mode="w" if first else "a", header=first, index=False)
+            first = False
+            total += len(out)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +312,8 @@ def log_pipeline_run(
         "records_skipped": int(records_skipped),
         "issues": issues or {},
     }
-    if USE_SAMPLE_DATA or not os.getenv("SUPABASE_URL"):
-        # Offline / no DB configured — persist locally so the demo still shows runs.
+    if not os.getenv("SUPABASE_URL"):
+        # No DB configured — persist locally so pipeline status still works.
         local = PROCESSED_DIR / "pipeline_runs.jsonl"
         with local.open("a") as f:
             f.write(json.dumps({**payload, "run_at": datetime.now().isoformat()}) + "\n")

@@ -9,7 +9,7 @@ import json
 import os
 from typing import Any, Optional
 
-from utils import USE_SAMPLE_DATA, get_logger
+from utils import get_logger
 
 log = get_logger("pipeline.llm")
 
@@ -18,7 +18,7 @@ MODEL = "gpt-4o-mini"
 
 def llm_available() -> bool:
     """True only when we should actually call OpenAI."""
-    return bool(os.getenv("OPENAI_API_KEY")) and not USE_SAMPLE_DATA
+    return bool(os.getenv("OPENAI_API_KEY"))
 
 
 _client = None

@@ -1,7 +1,7 @@
 """Stage 3 — LLM enrichment.
 
-Two independent enrichment steps, both with deterministic offline fallbacks so
-the pipeline runs end-to-end without an OpenAI key (USE_SAMPLE_DATA=1):
+Two independent enrichment steps, both with deterministic fallbacks so
+the pipeline runs end-to-end without an OpenAI key:
 
   Step 1 — Sector classification of every unique award program name into one of
            12 sectors. Cached by sha256(prog_name_en) so a name is never
@@ -15,6 +15,7 @@ the pipeline runs end-to-end without an OpenAI key (USE_SAMPLE_DATA=1):
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 
@@ -24,8 +25,11 @@ from llm import chat_json, llm_available
 from utils import (
     ACTIVITIES, CACHE_DIR, PROCESSED_DIR, RAW_DIR, SIZE_BANDS, SECTORS,
     VALID_PROVINCE_CODES, chunked, get_logger, load_json_cache,
-    log_pipeline_run, normalize_province, save_json_cache, sha256,
+    log_pipeline_run, normalize_province, read_csv_file,
+    save_json_cache, sha256,
 )
+
+SECTOR_MAP_PATH = PROCESSED_DIR / "program_sector_map.json"
 
 log = get_logger("pipeline.enrich")
 
@@ -106,8 +110,9 @@ async def classify_sectors(program_names: list[tuple[str, str]], issues: dict) -
     # Unique by name; never classify the same program name twice.
     unique: dict[str, str] = {}
     for name, desc in program_names:
+        name = str(name or "").strip()
         if name and name not in unique:
-            unique[name] = desc or ""
+            unique[name] = str(desc or "")
 
     result: dict[str, str] = {}
     todo: list[tuple[str, str]] = []
@@ -212,15 +217,25 @@ def _heuristic_eligibility(desc: str) -> dict:
     ptype = "Grant"
     if "loan" in text or "repayable" in text:
         ptype = "Loan"
-    elif "tax credit" in text:
+    elif "tax credit" in text or "sred" in text or "sr&ed" in text:
         ptype = "Tax Credit"
     elif "advisory" in text:
         ptype = "Advisory"
+
+    sred_related = bool(re.search(r"sred|sr&ed|scientific research|experimental development", text))
+    tax_credit_type = "SR&ED" if re.search(r"sred|sr&ed", text) else ("OTHER" if "tax credit" in text else None)
+
+    deadline = None
+    dm = re.search(r"deadline[:\s]+(\d{4}-\d{2}-\d{2})", text)
+    if dm:
+        deadline = dm.group(1)
 
     return {
         "eligible_provinces": provinces, "eligible_sizes": sizes,
         "eligible_activities": activities or ["Other"],
         "min_amount": min_amount, "max_amount": max_amount, "program_type": ptype,
+        "sred_related": sred_related, "tax_credit_type": tax_credit_type,
+        "deadline": deadline,
     }
 
 
@@ -283,13 +298,85 @@ def _latest_bbf() -> Path | None:
     return files[-1] if files else None
 
 
+def _pick_column(df: pd.DataFrame, *candidates: str) -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return df[col].fillna("").astype(str)
+    return pd.Series([""] * len(df), index=df.index)
+
+
+def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map Innovation Canada / BBF export columns to our canonical schema."""
+    df.columns = [
+        str(c).strip().lower().replace(" ", "_").replace("(", "").replace(")", "")
+        for c in df.columns
+    ]
+
+    name = _pick_column(
+        df,
+        "program_name",
+        "name",
+        "title",
+        "title_en",
+        "title_english",
+        "program_title",
+        "program_title_en",
+        "program_name_en",
+    )
+    department = _pick_column(
+        df,
+        "department",
+        "organization",
+        "organization_name",
+        "organization_name_en",
+        "department_en",
+        "owner_org",
+        "administering_department",
+    )
+    description = _pick_column(
+        df,
+        "description",
+        "description_en",
+        "long_description",
+        "long_description_en",
+        "program_description",
+        "program_description_en",
+        "short_description",
+    )
+    apply_url = _pick_column(
+        df,
+        "apply_url",
+        "url",
+        "link",
+        "link_en",
+        "website",
+        "program_url",
+        "application_url",
+        "business_benefits_finder_link",
+    )
+    deadline = _pick_column(df, "deadline", "application_deadline", "closing_date")
+    status = _pick_column(df, "status", "program_status", "availability")
+
+    out = pd.DataFrame(
+        {
+            "name": name.str.strip(),
+            "department": department.str.strip(),
+            "description": description.str.strip(),
+            "apply_url": apply_url.str.strip(),
+            "deadline": deadline.str.strip(),
+            "status": status.str.strip(),
+        }
+    )
+    out = out[out["name"] != ""].reset_index(drop=True)
+    return out
+
+
 def _read_bbf(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".xlsx", ".xls"}:
         df = pd.read_excel(path)
     else:
-        df = pd.read_csv(path)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+        df = read_csv_file(path)
+    return _normalize_bbf_columns(df)
 
 
 async def enrich_programs(issues: dict) -> pd.DataFrame:
@@ -319,24 +406,34 @@ async def enrich_programs(issues: dict) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 async def run() -> None:
     issues: dict = {}
+    awards_path = PROCESSED_DIR / "awards_clean.csv"
 
-    awards = pd.read_csv(PROCESSED_DIR / "awards_clean.csv")
-    pairs = list(zip(
-        awards["program_name_raw"].fillna("").tolist(),
-        awards.get("description", pd.Series([""] * len(awards))).fillna("").tolist(),
-    ))
-    sector_map = await classify_sectors(pairs, issues)
-    awards["sector_normalized"] = awards["program_name_raw"].map(sector_map).fillna("OTHER")
-    awards["program_name_normalized"] = (
-        awards["program_name_raw"].fillna("").str.strip().str.lower()
+    # Classify unique program names only — not every award row (1.3M+).
+    names_df = read_csv_file(
+        awards_path,
+        usecols=["program_name_raw", "description"],
     )
-    awards.to_csv(PROCESSED_DIR / "awards_clean.csv", index=False)
-    log.info("Applied %s sector classifications to awards", awards["sector_normalized"].nunique())
+    unique = names_df.drop_duplicates(subset=["program_name_raw"], keep="first").copy()
+    unique["program_name_raw"] = unique["program_name_raw"].fillna("").astype(str)
+    unique["description"] = unique["description"].fillna("").astype(str)
+    unique = unique[unique["program_name_raw"].str.strip() != ""]
+    pairs = list(zip(unique["program_name_raw"], unique["description"]))
+    del names_df, unique
+
+    sector_map = await classify_sectors(pairs, issues)
+
+    SECTOR_MAP_PATH.write_text(
+        json.dumps(sector_map, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    log.info(
+        "Saved sector map for %s programs -> %s (applied at load time; no CSV rewrite)",
+        len(sector_map), SECTOR_MAP_PATH.name,
+    )
 
     await enrich_programs(issues)
 
-    n_programs = awards["program_name_raw"].nunique()
-    log_pipeline_run("enrich", n_programs, n_programs, 0, issues)
+    log_pipeline_run("enrich", len(sector_map), len(sector_map), 0, issues)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,23 @@ export const ACTIVITIES = [
   "Clean Tech",
 ];
 
+export const PROGRAM_TYPES = [
+  "Grant",
+  "Loan",
+  "Tax Credit",
+  "Advisory",
+  "Other",
+];
+
+export const COMMON_NAICS: { code: string; title: string; sector: string }[] = [
+  { code: "541510", title: "Computer Systems Design", sector: "IT_SOFTWARE" },
+  { code: "541512", title: "Computer Systems Design Services", sector: "CYBERSECURITY" },
+  { code: "541330", title: "Engineering Services", sector: "ENGINEERING" },
+  { code: "541611", title: "Management Consulting", sector: "MANAGEMENT_CONSULTING" },
+  { code: "541714", title: "R&D in Biotechnology", sector: "LIFE_SCIENCES" },
+  { code: "541620", title: "Environmental Consulting", sector: "CLEAN_TECH" },
+];
+
 export function sectorLabel(value?: string): string {
   return SECTORS.find((s) => s.value === value)?.label || value || "—";
 }

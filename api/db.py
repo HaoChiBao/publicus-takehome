@@ -19,72 +19,64 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from features import (
+    browse_programs,
+    build_recipient_summaries,
+    compute_alerts,
+    enrich_program,
+    overlap_flags,
+    program_naics_prefixes,
+    readiness_checklist,
+    score_program,
+    similar_recipients,
+)
+
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = ROOT / "data" / "processed"
 
 
-# ---------------------------------------------------------------------------
-# Shared scoring helper (used by both backends + dashboard)
-# ---------------------------------------------------------------------------
-def score_program(profile: dict, program: dict, recent_program_ids: set) -> dict:
-    """Implements the documented weighted match score + human-readable reasons."""
-    province = profile.get("province")
-    sector = profile.get("sector")
-    size_band = profile.get("size_band")
-
-    elig_prov = program.get("eligible_provinces") or []
-    elig_sect = program.get("eligible_sectors") or []
-    elig_size = program.get("eligible_sizes") or []
-
-    province_ok = province in elig_prov or "ALL" in elig_prov
-    sector_ok = sector in elig_sect
-    size_ok = size_band in elig_size
-    history_ok = program.get("id") in recent_program_ids
-
-    raw = (
-        province_ok * 0.4
-        + sector_ok * 0.3
-        + size_ok * 0.2
-        + history_ok * 0.1
-    )
-    score = raw * (1 if program.get("is_open") else 0)
-
-    reasons = []
-    if province_ok:
-        reasons.append(f"Open to {province}" if province in elig_prov else "Available nationally")
-    if sector_ok:
-        reasons.append(f"Funds {sector.replace('_', ' ').title()} companies")
-    if size_ok:
-        reasons.append(f"Fits {size_band}-employee firms")
-    if history_ok:
-        reasons.append("Actively awarded in the last 2 fiscal years")
-
-    return {
-        "score": round(score, 3),
-        "match": {
-            "province": province_ok, "sector": sector_ok,
-            "size": size_ok, "hasHistory": history_ok,
-        },
-        "match_reasons": reasons,
-    }
-
-
 # ===========================================================================
 # JSON snapshot backend
 # ===========================================================================
 class JsonRepository:
+    REQUIRED_SNAPSHOTS = (
+        "db_grant_programs.json",
+        "db_grant_awards.json",
+        "db_recipients.json",
+    )
+
     def __init__(self) -> None:
-        self.recipients = self._load("db_recipients.json")
-        self.programs = self._load("db_grant_programs.json")
-        self.awards = self._load("db_grant_awards.json")
+        missing = [
+            name for name in self.REQUIRED_SNAPSHOTS
+            if not (PROCESSED_DIR / name).exists()
+        ]
+        self.data_ready = not missing
+        self.data_error = (
+            "Processed data not found. Run `python pipeline/run_all.py` first. "
+            f"Missing: {', '.join(missing)}"
+            if missing
+            else None
+        )
+
+        self.recipients = self._load("db_recipients.json") if self.data_ready else []
+        raw_programs = self._load("db_grant_programs.json") if self.data_ready else []
+        self.awards = self._load("db_grant_awards.json") if self.data_ready else []
         self.runs = self._load_runs()
+        naics_by_prog = program_naics_prefixes(self.awards)
+        self.programs = [
+            enrich_program(p, naics_by_prog.get(p["id"], [])) for p in raw_programs
+        ]
+        self.programs_by_id = {p["id"]: p for p in self.programs}
+        self.recipient_summaries = build_recipient_summaries(self.recipients, self.awards)
         self.profiles: dict[str, dict] = {}
         self._profiles_path = PROCESSED_DIR / "db_company_profiles.json"
         if self._profiles_path.exists():
             for p in json.loads(self._profiles_path.read_text()):
                 self.profiles[p["session_id"]] = p
+        self.watchlist: list[dict] = self._load("db_watchlist_items.json")
+        self._watchlist_path = PROCESSED_DIR / "db_watchlist_items.json"
 
     @staticmethod
     def _load(name: str) -> list[dict]:
@@ -127,6 +119,43 @@ class JsonRepository:
                 scored.append({**p, **s})
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    async def search_programs(
+        self,
+        *,
+        profile: Optional[dict] = None,
+        q: Optional[str] = None,
+        sector: Optional[str] = None,
+        province: Optional[str] = None,
+        size_band: Optional[str] = None,
+        program_type: Optional[str] = None,
+        is_open: Optional[bool] = None,
+        activity: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        max_amount: Optional[float] = None,
+        sort: str = "score",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        recent = self._recent_program_ids()
+        programs, total = browse_programs(
+            self.programs,
+            recent,
+            profile=profile,
+            q=q,
+            sector=sector,
+            province=province,
+            size_band=size_band,
+            program_type=program_type,
+            is_open=is_open,
+            activity=activity,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+        return {"programs": programs, "total": total}
 
     async def sector_summary(self, sector: str, province: Optional[str], years: int = 2) -> dict:
         recent = set(self._recent_fiscal_years(years))
@@ -274,6 +303,60 @@ class JsonRepository:
     async def pipeline_status(self, limit: int = 5) -> list[dict]:
         return list(reversed(self.runs))[:limit]
 
+    async def get_alerts(self, profile: dict, days: int = 90) -> list[dict]:
+        matches = await self.match_programs(profile, limit=50)
+        return compute_alerts(matches, days)
+
+    async def get_similar_recipients(self, profile: dict, limit: int = 8) -> list[dict]:
+        return similar_recipients(
+            profile, self.recipient_summaries, self.programs_by_id, limit
+        )
+
+    async def program_readiness(self, profile: dict, program_id: str) -> Optional[dict]:
+        program = self.programs_by_id.get(program_id)
+        if not program:
+            return None
+        return readiness_checklist(profile, program)
+
+    async def program_overlap(self, profile: dict, program_id: str) -> list[dict]:
+        program = self.programs_by_id.get(program_id)
+        if not program:
+            return []
+        return overlap_flags(profile, program, self.programs)
+
+    async def get_watchlist(self, session_id: str) -> dict:
+        items = [w for w in self.watchlist if w["session_id"] == session_id]
+        programs = [self.programs_by_id[w["entity_id"]] for w in items
+                    if w["entity_type"] == "program" and w["entity_id"] in self.programs_by_id]
+        rec_ids = {w["entity_id"] for w in items if w["entity_type"] == "recipient"}
+        recipients = []
+        for rid in rec_ids:
+            s = self.recipient_summaries.get(rid)
+            if s:
+                recipients.append({
+                    "id": s["id"], "name": s["name"], "province": s.get("province"),
+                    "city": s.get("city"), "award_count": s["award_count"],
+                    "total_amount": s["total_amount"],
+                })
+        return {"programs": programs, "recipients": recipients}
+
+    async def add_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
+        key = (session_id, entity_type, entity_id)
+        if not any((w["session_id"], w["entity_type"], w["entity_id"]) == key for w in self.watchlist):
+            item = {"session_id": session_id, "entity_type": entity_type, "entity_id": entity_id}
+            self.watchlist.append(item)
+            self._watchlist_path.write_text(json.dumps(self.watchlist, indent=2))
+        return {"ok": True}
+
+    async def remove_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
+        self.watchlist = [
+            w for w in self.watchlist
+            if not (w["session_id"] == session_id and w["entity_type"] == entity_type
+                    and w["entity_id"] == entity_id)
+        ]
+        self._watchlist_path.write_text(json.dumps(self.watchlist, indent=2))
+        return {"ok": True}
+
 
 # ===========================================================================
 # Postgres backend
@@ -282,11 +365,51 @@ class PgRepository:
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
         self.pool = None
+        self._programs_cache: Optional[list[dict]] = None
+        self._summaries_cache: Optional[dict[str, dict]] = None
+        self._watchlist_path = PROCESSED_DIR / "db_watchlist_items.json"
 
     async def connect(self):
         import asyncpg
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
         return self
+
+    async def _ensure_caches(self):
+        if self._programs_cache is not None:
+            return
+        rows = await self.pool.fetch("SELECT * FROM grant_programs")
+        programs = [self._row(r) for r in rows]
+        award_rows = await self.pool.fetch(
+            "SELECT program_id, naics_code, is_latest_amendment FROM grant_awards "
+            "WHERE program_id IS NOT NULL AND naics_code IS NOT NULL"
+        )
+        awards_stub = [self._row(r) for r in award_rows]
+        naics_by_prog = program_naics_prefixes(awards_stub)
+        self._programs_cache = [
+            enrich_program(p, naics_by_prog.get(p["id"], [])) for p in programs
+        ]
+        rec_rows = await self.pool.fetch("SELECT * FROM recipients")
+        recipients = [self._row(r) for r in rec_rows]
+        all_awards = await self.pool.fetch(
+            "SELECT recipient_id, sector_normalized, province, naics_code, "
+            "program_id, amount, is_latest_amendment FROM grant_awards"
+        )
+        self._summaries_cache = build_recipient_summaries(
+            recipients, [self._row(a) for a in all_awards]
+        )
+
+    async def _programs_by_id(self) -> dict[str, dict]:
+        await self._ensure_caches()
+        return {p["id"]: p for p in self._programs_cache}
+
+    def _load_watchlist(self) -> list[dict]:
+        if self._watchlist_path.exists():
+            return json.loads(self._watchlist_path.read_text())
+        return []
+
+    def _save_watchlist_file(self, items: list[dict]):
+        self._watchlist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._watchlist_path.write_text(json.dumps(items, indent=2))
 
     async def close(self):
         if self.pool:
@@ -328,6 +451,44 @@ class PgRepository:
                 scored.append({**p, **s})
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    async def search_programs(
+        self,
+        *,
+        profile: Optional[dict] = None,
+        q: Optional[str] = None,
+        sector: Optional[str] = None,
+        province: Optional[str] = None,
+        size_band: Optional[str] = None,
+        program_type: Optional[str] = None,
+        is_open: Optional[bool] = None,
+        activity: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        max_amount: Optional[float] = None,
+        sort: str = "score",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        await self._ensure_caches()
+        recent = await self._recent_program_ids()
+        programs, total = browse_programs(
+            self._programs_cache or [],
+            recent,
+            profile=profile,
+            q=q,
+            sector=sector,
+            province=province,
+            size_band=size_band,
+            program_type=program_type,
+            is_open=is_open,
+            activity=activity,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+        return {"programs": programs, "total": total}
 
     async def sector_summary(self, sector: str, province: Optional[str], years: int = 2) -> dict:
         fys = await self._recent_fiscal_years(years)
@@ -464,18 +625,82 @@ class PgRepository:
 
     async def create_profile(self, profile: dict) -> dict:
         row = await self.pool.fetchrow(
-            "INSERT INTO company_profiles (session_id, name, sector, province, size_band, activities) "
-            "VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (session_id) DO UPDATE SET "
+            "INSERT INTO company_profiles "
+            "(session_id, name, sector, province, size_band, activities, naics_code) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id) DO UPDATE SET "
             "name=EXCLUDED.name, sector=EXCLUDED.sector, province=EXCLUDED.province, "
-            "size_band=EXCLUDED.size_band, activities=EXCLUDED.activities RETURNING *",
+            "size_band=EXCLUDED.size_band, activities=EXCLUDED.activities, "
+            "naics_code=EXCLUDED.naics_code RETURNING *",
             profile["session_id"], profile.get("name"), profile.get("sector"),
-            profile.get("province"), profile.get("size_band"), profile.get("activities") or [])
+            profile.get("province"), profile.get("size_band"),
+            profile.get("activities") or [], profile.get("naics_code"),
+        )
         return self._row(row)
 
     async def pipeline_status(self, limit: int = 5) -> list[dict]:
         rows = await self.pool.fetch(
             "SELECT * FROM pipeline_runs ORDER BY run_at DESC LIMIT $1", limit)
         return [self._row(r) for r in rows]
+
+    async def get_alerts(self, profile: dict, days: int = 90) -> list[dict]:
+        matches = await self.match_programs(profile, limit=50)
+        return compute_alerts(matches, days)
+
+    async def get_similar_recipients(self, profile: dict, limit: int = 8) -> list[dict]:
+        await self._ensure_caches()
+        return similar_recipients(
+            profile, self._summaries_cache, await self._programs_by_id(), limit
+        )
+
+    async def program_readiness(self, profile: dict, program_id: str) -> Optional[dict]:
+        programs = await self._programs_by_id()
+        program = programs.get(program_id)
+        if not program:
+            return None
+        return readiness_checklist(profile, program)
+
+    async def program_overlap(self, profile: dict, program_id: str) -> list[dict]:
+        programs = await self._programs_by_id()
+        program = programs.get(program_id)
+        if not program:
+            return []
+        return overlap_flags(profile, program, list(programs.values()))
+
+    async def get_watchlist(self, session_id: str) -> dict:
+        items = [w for w in self._load_watchlist() if w["session_id"] == session_id]
+        programs_by_id = await self._programs_by_id()
+        programs = [programs_by_id[w["entity_id"]] for w in items
+                    if w["entity_type"] == "program" and w["entity_id"] in programs_by_id]
+        await self._ensure_caches()
+        recipients = []
+        for w in items:
+            if w["entity_type"] != "recipient":
+                continue
+            s = self._summaries_cache.get(w["entity_id"])
+            if s:
+                recipients.append({
+                    "id": s["id"], "name": s["name"], "province": s.get("province"),
+                    "city": s.get("city"), "award_count": s["award_count"],
+                    "total_amount": s["total_amount"],
+                })
+        return {"programs": programs, "recipients": recipients}
+
+    async def add_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
+        items = self._load_watchlist()
+        key = (session_id, entity_type, entity_id)
+        if not any((w["session_id"], w["entity_type"], w["entity_id"]) == key for w in items):
+            items.append({"session_id": session_id, "entity_type": entity_type, "entity_id": entity_id})
+            self._save_watchlist_file(items)
+        return {"ok": True}
+
+    async def remove_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
+        items = [
+            w for w in self._load_watchlist()
+            if not (w["session_id"] == session_id and w["entity_type"] == entity_type
+                    and w["entity_id"] == entity_id)
+        ]
+        self._save_watchlist_file(items)
+        return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

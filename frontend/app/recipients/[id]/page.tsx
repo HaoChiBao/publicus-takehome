@@ -7,6 +7,7 @@ import { api, type Award } from "@/lib/api";
 import { formatCurrency, formatCurrencyFull } from "@/lib/format";
 import { sectorLabel } from "@/lib/constants";
 import RecipientTable from "@/components/RecipientTable";
+import WatchlistButton from "@/components/WatchlistButton";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
@@ -88,9 +89,12 @@ export default function RecipientHistoryPage({
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Full grant history for
           </p>
-          <h1 className="text-2xl font-bold tracking-tight">
-            {recipient.name_normalized}
-          </h1>
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <h1 className="text-2xl font-bold tracking-tight">
+              {recipient.name_normalized}
+            </h1>
+            <WatchlistButton entityType="recipient" entityId={params.id} />
+          </div>
 
           <div className="mt-5 grid grid-cols-2 gap-x-8 gap-y-5 sm:grid-cols-4">
             <Stat

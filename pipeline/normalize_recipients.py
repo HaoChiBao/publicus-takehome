@@ -27,9 +27,15 @@ import pandas as pd
 from rapidfuzz import fuzz
 
 from llm import chat_json, llm_available
-from utils import PROCESSED_DIR, get_logger, log_pipeline_run
+from utils import (
+    PROCESSED_DIR, get_logger, iter_csv_chunks, log_pipeline_run, read_csv_file,
+    rewrite_csv_in_chunks,
+)
 
 log = get_logger("pipeline.normalize_recipients")
+
+CHUNK_SIZE = 100_000
+SCAN_COLS = ["recipient_name_raw", "recipient_business_number", "province", "city"]
 
 AUTO_MERGE = 88     # >= this -> same company
 AMBIGUOUS_LOW = 75  # [75, 88) -> ask the LLM
@@ -130,11 +136,32 @@ async def confirm_ambiguous(
 # Main resolution
 # ---------------------------------------------------------------------------
 async def resolve() -> pd.DataFrame:
-    awards = pd.read_csv(PROCESSED_DIR / "awards_clean.csv")
-    awards["recipient_name_raw"] = awards["recipient_name_raw"].fillna("").astype(str)
+    awards_path = PROCESSED_DIR / "awards_clean.csv"
+    name_counts: Counter = Counter()
+    name_bns: dict[str, Counter] = defaultdict(Counter)
+    name_provs: dict[str, Counter] = defaultdict(Counter)
+    name_cities: dict[str, Counter] = defaultdict(Counter)
 
-    # Distinct raw names + the attributes we'll roll up onto the canonical record.
-    raw_names = sorted({n for n in awards["recipient_name_raw"] if n.strip()})
+    log.info("Scanning recipient names from %s in chunks", awards_path.name)
+    for chunk in iter_csv_chunks(awards_path, usecols=SCAN_COLS, chunksize=CHUNK_SIZE):
+        chunk["recipient_name_raw"] = chunk["recipient_name_raw"].fillna("").astype(str)
+        for name, bn, prov, city in zip(
+            chunk["recipient_name_raw"],
+            chunk.get("recipient_business_number", ""),
+            chunk.get("province", ""),
+            chunk.get("city", ""),
+        ):
+            if not str(name).strip():
+                continue
+            name_counts[name] += 1
+            if str(bn).strip():
+                name_bns[name][str(bn)] += 1
+            if str(prov).strip():
+                name_provs[name][str(prov)] += 1
+            if str(city).strip():
+                name_cities[name][str(city)] += 1
+
+    raw_names = sorted(name_counts.keys())
     key_for = {n: preprocess_name(n) for n in raw_names}
 
     # Step 2 — blocking by first 3 chars of the preprocessed key.
@@ -173,29 +200,38 @@ async def resolve() -> pd.DataFrame:
     clusters = uf.clusters()
     log.info("Clustered %s raw names -> %s canonical recipients", len(raw_names), len(clusters))
 
-    attrs = awards.set_index("recipient_name_raw")
     recipients = []
     canonical_of: dict[str, str] = {}   # raw name -> canonical name
 
     for members in clusters.values():
-        # Most common raw spelling (by award frequency) becomes the canonical form.
-        freq = awards[awards["recipient_name_raw"].isin(members)]["recipient_name_raw"]
-        canonical = freq.value_counts().idxmax() if len(freq) else members[0]
+        canonical = max(members, key=lambda m: name_counts[m])
         for m in members:
             canonical_of[m] = canonical
 
-        sub = awards[awards["recipient_name_raw"].isin(members)]
+        bn_counter: Counter = Counter()
+        prov_counter: Counter = Counter()
+        city_counter: Counter = Counter()
+        for m in members:
+            bn_counter.update(name_bns[m])
+            prov_counter.update(name_provs[m])
+            city_counter.update(name_cities[m])
+
         recipients.append({
             "name_normalized": canonical,
             "names_raw": sorted(set(members)),
-            "business_number": _mode(sub.get("recipient_business_number")),
-            "province": _mode(sub.get("province")),
-            "city": _mode(sub.get("city")),
+            "business_number": bn_counter.most_common(1)[0][0] if bn_counter else None,
+            "province": prov_counter.most_common(1)[0][0] if prov_counter else None,
+            "city": city_counter.most_common(1)[0][0] if city_counter else None,
         })
 
-    # Link every award to its canonical recipient name (load.py resolves to a UUID).
-    awards["recipient_canonical"] = awards["recipient_name_raw"].map(canonical_of)
-    awards.to_csv(PROCESSED_DIR / "awards_clean.csv", index=False)
+    def _link_canonical(chunk: pd.DataFrame) -> pd.DataFrame:
+        chunk["recipient_name_raw"] = chunk["recipient_name_raw"].fillna("").astype(str)
+        chunk["recipient_canonical"] = chunk["recipient_name_raw"].map(canonical_of)
+        chunk["recipient_canonical"] = chunk["recipient_canonical"].fillna(chunk["recipient_name_raw"])
+        return chunk
+
+    log.info("Linking canonical recipient names back to awards (chunked)")
+    rewrite_csv_in_chunks(awards_path, _link_canonical, chunksize=CHUNK_SIZE)
 
     rec_df = pd.DataFrame(recipients)
     rec_df.to_csv(PROCESSED_DIR / "recipients.csv", index=False)

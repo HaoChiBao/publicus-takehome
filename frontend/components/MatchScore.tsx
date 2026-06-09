@@ -6,6 +6,8 @@ interface Props {
   sector: boolean;
   size: boolean;
   hasHistory: boolean;
+  naics?: boolean;
+  activities?: boolean;
 }
 
 function Chip({ label, ok }: { label: string; ok: boolean }) {
@@ -24,12 +26,21 @@ function Chip({ label, ok }: { label: string; ok: boolean }) {
   );
 }
 
-export default function MatchScore({ province, sector, size, hasHistory }: Props) {
+export default function MatchScore({
+  province,
+  sector,
+  size,
+  hasHistory,
+  naics,
+  activities,
+}: Props) {
   return (
     <div className="flex flex-wrap gap-1.5">
       <Chip label="Province" ok={province} />
       <Chip label="Sector" ok={sector} />
       <Chip label="Size" ok={size} />
+      {naics !== undefined && <Chip label="NAICS" ok={naics} />}
+      {activities !== undefined && <Chip label="Activities" ok={activities} />}
       <Chip label="Recently awarded" ok={hasHistory} />
     </div>
   );
