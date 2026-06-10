@@ -10,4 +10,4 @@ COPY api ./api
 
 EXPOSE 8000
 # Set DATABASE_URL to your Supabase Session pooler URI — API reads from Postgres.
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--app-dir", "api", "--host", "0.0.0.0", "--port", "8000"]

@@ -589,24 +589,28 @@ async def _migrate_session_data(conn) -> None:
 
 
 async def run() -> None:
-    import knowledge
-    import index_search
-    import stats as stats_mod
-
     ctx = build_context()
-    program_stats = stats_mod.compute_program_stats(ctx)
-    stats_mod.save_stats(program_stats)
+    awards_only = os.getenv("LOAD_AWARDS_ONLY") == "1"
 
-    # Attach NAICS prefixes from stats
-    stats_by_id = {s["grant_program_id"]: s for s in program_stats}
-    for p in ctx.programs:
-        s = stats_by_id.get(p["id"])
-        if s:
-            p["eligible_naics_prefixes"] = s.get("naics_top_prefixes") or []
+    if awards_only:
+        log.info("LOAD_AWARDS_ONLY=1 — skipping stats/knowledge/index; uploading awards only")
+    else:
+        import knowledge
+        import index_search
+        import stats as stats_mod
 
-    await knowledge.run(ctx)
-    await index_search.run(ctx)
-    write_snapshot(ctx)
+        program_stats = stats_mod.compute_program_stats(ctx)
+        stats_mod.save_stats(program_stats)
+
+        stats_by_id = {s["grant_program_id"]: s for s in program_stats}
+        for p in ctx.programs:
+            s = stats_by_id.get(p["id"])
+            if s:
+                p["eligible_naics_prefixes"] = s.get("naics_top_prefixes") or []
+
+        await knowledge.run(ctx)
+        await index_search.run(ctx)
+        write_snapshot(ctx)
 
     if os.getenv("DATABASE_URL"):
         try:
