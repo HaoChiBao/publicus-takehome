@@ -406,7 +406,20 @@ async def enrich_programs(issues: dict) -> pd.DataFrame:
     if path is None:
         log.warning("No BBF file found; skipping program enrichment")
         return pd.DataFrame()
-    df = _read_bbf(path)
+    # Preserve full raw export for knowledge layer (all BBF columns)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        raw_full = pd.read_excel(path)
+    else:
+        raw_full = read_csv_file(path)
+    raw_full.columns = [str(c).strip() for c in raw_full.columns]
+    raw_path = PROCESSED_DIR / "bbf_raw.json"
+    raw_path.write_text(
+        json.dumps(raw_full.to_dict(orient="records"), ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    log.info("Saved full BBF raw payload (%s rows) -> %s", len(raw_full), raw_path.name)
+
+    df = _normalize_bbf_columns(raw_full)
     log.info("Enriching %s BBF programs (llm=%s)", len(df), llm_available())
 
     descs = df.get("description", pd.Series([""] * len(df))).fillna("").tolist()

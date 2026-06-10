@@ -243,13 +243,16 @@ def build_context() -> LoadContext:
         pid = program_ids.get(name) or str(uuid.uuid4())
         program_id_by_norm[norm] = pid
         program_id_by_loose[_loose_key(name)] = pid
+        desc = _str(p.get("description"))
         programs.append({
             "id": pid,
             "source": "bbf",
             "name": name,
             "department": _str(p.get("department")),
             "program_type": _str(p.get("program_type")),
-            "description": _str(p.get("description")),
+            "description": desc,
+            "short_description": desc[:300] if desc else None,
+            "long_description": desc,
             "min_amount": _num(p.get("min_amount")),
             "max_amount": _num(p.get("max_amount")),
             "eligible_provinces": _as_list(p.get("eligible_provinces")),
@@ -257,10 +260,12 @@ def build_context() -> LoadContext:
             "eligible_sizes": _as_list(p.get("eligible_sizes")),
             "eligible_activities": _as_list(p.get("eligible_activities")),
             "deadline": _str(p.get("deadline")) or None,
+            "status": _str(p.get("status")),
             "is_open": _bbf_is_open(p),
             "sred_related": bool(p.get("sred_related")),
             "tax_credit_type": _str(p.get("tax_credit_type")),
             "apply_url": _str(p.get("apply_url")),
+            "source_url": _str(p.get("apply_url")),
             "last_updated": pd.Timestamp.now().date().isoformat(),
         })
     if skipped_programs:
@@ -317,6 +322,20 @@ def write_snapshot(ctx: LoadContext) -> None:
         )
         log.info("Snapshot: %s rows -> %s", len(rows), path.name)
 
+    for extra in (
+        "grant_program_stats.json",
+        "grant_program_sources.json",
+        "grant_program_metadata.json",
+        "grant_insights.json",
+        "grant_content_chunks.json",
+        "grant_embeddings.json",
+    ):
+        src = PROCESSED_DIR / extra
+        if src.exists():
+            dst = PROCESSED_DIR / f"db_{extra}"
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            log.info("Snapshot: %s", dst.name)
+
 
 async def _executemany_batched(conn, sql: str, rows: list[tuple], label: str) -> None:
     for i in range(0, len(rows), INSERT_BATCH):
@@ -346,25 +365,44 @@ async def write_to_db(ctx: LoadContext) -> None:
             log.info("LOAD_AWARDS_ONLY=1 — uploading grant_awards only")
             await conn.execute("TRUNCATE grant_awards RESTART IDENTITY")
         else:
-            await conn.execute(
-                "TRUNCATE grant_awards, grant_programs, recipients RESTART IDENTITY CASCADE"
-            )
+            await conn.execute("""
+                TRUNCATE grant_embeddings, grant_content_chunks, grant_insights,
+                         grant_program_metadata, grant_program_sources, grant_program_stats,
+                         grant_awards, grant_programs, recipients RESTART IDENTITY CASCADE
+            """)
 
             # Programs first (small) so grant search works even if later stages are slow.
             await _executemany_batched(
                 conn,
                 """INSERT INTO grant_programs
-                   (id, source, name, department, program_type, description, min_amount, max_amount,
-                    eligible_provinces, eligible_sectors, eligible_sizes, eligible_activities,
-                    deadline, is_open, apply_url, last_updated)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
-                [(p["id"], p["source"], p["name"], p["department"], p["program_type"], p["description"],
-                  p["min_amount"], p["max_amount"], p["eligible_provinces"], p["eligible_sectors"],
-                  p["eligible_sizes"], p["eligible_activities"],
-                  _date(p["deadline"]), p["is_open"], p["apply_url"], _date(p["last_updated"]))
+                   (id, source, name, department, program_type, description,
+                    short_description, long_description, status,
+                    min_amount, max_amount, eligible_provinces, eligible_sectors,
+                    eligible_sizes, eligible_activities, eligible_naics_prefixes,
+                    deadline, is_open, sred_related, tax_credit_type, apply_url, source_url,
+                    summary_1liner, eligibility_narrative, target_audience,
+                    application_steps, stacking_notes, keywords, content_hash, last_updated)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                           $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)""",
+                [(p["id"], p["source"], p["name"], p["department"], p["program_type"],
+                  p.get("description"), p.get("short_description"), p.get("long_description"),
+                  p.get("status"), p["min_amount"], p["max_amount"],
+                  p["eligible_provinces"], p["eligible_sectors"], p["eligible_sizes"],
+                  p["eligible_activities"], p.get("eligible_naics_prefixes"),
+                  _date(p["deadline"]), p["is_open"], p.get("sred_related", False),
+                  p.get("tax_credit_type"), p["apply_url"], p.get("source_url"),
+                  p.get("summary_1liner"), p.get("eligibility_narrative"),
+                  p.get("target_audience"), p.get("application_steps"),
+                  p.get("stacking_notes"), p.get("keywords"), p.get("content_hash"),
+                  _date(p["last_updated"]))
                  for p in ctx.programs],
                 "grant_programs",
             )
+
+            for p in ctx.programs:
+                await conn.execute("SELECT refresh_program_search_vector($1)", p["id"])
+
+            await _load_knowledge_tables(conn)
 
             await _executemany_batched(
                 conn,
@@ -396,6 +434,105 @@ async def write_to_db(ctx: LoadContext) -> None:
             await _migrate_session_data(conn)
     finally:
         await conn.close()
+
+
+async def _load_json(name: str) -> list:
+    path = PROCESSED_DIR / name
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+async def _load_knowledge_tables(conn) -> None:
+    """Load stats, sources, metadata, chunks, embeddings, insights into Postgres."""
+    try:
+        await conn.fetchval("SELECT 1 FROM grant_program_stats LIMIT 1")
+    except Exception:
+        log.warning(
+            "Knowledge tables missing — run supabase/migrations/002_search_and_knowledge.sql first"
+        )
+        return
+
+    stats = await _load_json("grant_program_stats.json")
+    if stats:
+        await conn.executemany(
+            """INSERT INTO grant_program_stats
+               (grant_program_id, total_disbursed, award_count, recipient_count,
+                avg_award, median_award, p90_award, largest_award,
+                provinces_active, sectors_active, naics_top_prefixes,
+                yoy_growth_pct, last_award_date, award_by_fiscal_year, top_recipient_names)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)""",
+            [(s["grant_program_id"], s["total_disbursed"], s["award_count"],
+              s["recipient_count"], s["avg_award"], s["median_award"], s["p90_award"],
+              s["largest_award"], s["provinces_active"], s["sectors_active"],
+              s["naics_top_prefixes"], s.get("yoy_growth_pct"),
+              _date(s.get("last_award_date")),
+              json.dumps(s.get("award_by_fiscal_year", [])),
+              s.get("top_recipient_names") or []) for s in stats],
+        )
+        log.info("Inserted %s grant_program_stats", len(stats))
+
+    sources = await _load_json("grant_program_sources.json")
+    if sources:
+        await conn.executemany(
+            """INSERT INTO grant_program_sources
+               (grant_program_id, source, external_id, raw_payload, content_hash)
+               VALUES ($1,$2,$3,$4::jsonb,$5)""",
+            [(s["grant_program_id"], s["source"], s.get("external_id") or None,
+              json.dumps(s["raw_payload"], default=str), s["content_hash"]) for s in sources],
+        )
+        log.info("Inserted %s grant_program_sources", len(sources))
+
+    metadata = await _load_json("grant_program_metadata.json")
+    if metadata:
+        await conn.executemany(
+            """INSERT INTO grant_program_metadata
+               (grant_program_id, summary_1liner, eligibility_narrative, target_audience,
+                application_steps, typical_projects, stacking_notes, keywords, enrichment_model)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+            [(m["grant_program_id"], m.get("summary_1liner"), m.get("eligibility_narrative"),
+              m.get("target_audience"), m.get("application_steps"),
+              m.get("typical_projects"), m.get("stacking_notes"),
+              m.get("keywords"), m.get("enrichment_model")) for m in metadata],
+        )
+        log.info("Inserted %s grant_program_metadata", len(metadata))
+
+    chunks = await _load_json("grant_content_chunks.json")
+    if chunks:
+        import uuid as _uuid
+        await conn.executemany(
+            """INSERT INTO grant_content_chunks
+               (id, grant_program_id, chunk_index, chunk_type, content, token_estimate)
+               VALUES ($1,$2,$3,$4,$5,$6)""",
+            [(str(_uuid.uuid4()), c["grant_program_id"], c["chunk_index"],
+              c["chunk_type"], c["content"], c.get("token_estimate")) for c in chunks],
+        )
+        log.info("Inserted %s grant_content_chunks", len(chunks))
+
+    embeddings = await _load_json("grant_embeddings.json")
+    if embeddings:
+        import uuid as _uuid
+        await conn.executemany(
+            """INSERT INTO grant_embeddings
+               (id, entity_type, entity_id, model, embedding, content_text, metadata)
+               VALUES ($1,$2,$3,$4,$5::vector,$6,$7::jsonb)""",
+            [(str(_uuid.uuid4()), e["entity_type"], e["entity_id"], e["model"],
+              str(e["embedding"]), e.get("content_text"), "{}") for e in embeddings],
+        )
+        log.info("Inserted %s grant_embeddings", len(embeddings))
+
+    insights = await _load_json("grant_insights.json")
+    if insights:
+        import uuid as _uuid
+        await conn.executemany(
+            """INSERT INTO grant_insights
+               (id, grant_program_id, insight_type, audience, content, evidence, model)
+               VALUES ($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7)""",
+            [(str(_uuid.uuid4()), i["grant_program_id"], i["insight_type"],
+              json.dumps(i.get("audience", {})), i["content"],
+              json.dumps(i.get("evidence", {}), default=str), i.get("model")) for i in insights],
+        )
+        log.info("Inserted %s grant_insights", len(insights))
 
 
 async def _migrate_session_data(conn) -> None:
@@ -452,7 +589,23 @@ async def _migrate_session_data(conn) -> None:
 
 
 async def run() -> None:
+    import knowledge
+    import index_search
+    import stats as stats_mod
+
     ctx = build_context()
+    program_stats = stats_mod.compute_program_stats(ctx)
+    stats_mod.save_stats(program_stats)
+
+    # Attach NAICS prefixes from stats
+    stats_by_id = {s["grant_program_id"]: s for s in program_stats}
+    for p in ctx.programs:
+        s = stats_by_id.get(p["id"])
+        if s:
+            p["eligible_naics_prefixes"] = s.get("naics_top_prefixes") or []
+
+    await knowledge.run(ctx)
+    await index_search.run(ctx)
     write_snapshot(ctx)
 
     if os.getenv("DATABASE_URL"):

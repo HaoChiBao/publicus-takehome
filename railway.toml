@@ -1,0 +1,10 @@
+# Railway API service — deploy from repo root.
+# In the Railway dashboard, set the service root to this repo (not frontend/).
+[build]
+builder = "RAILPACK"
+buildCommand = "pip install -r requirements-api.txt"
+
+[deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

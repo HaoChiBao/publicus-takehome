@@ -20,6 +20,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from features import (
+    answer_grant_question,
     browse_programs,
     build_recipient_summaries,
     compute_alerts,
@@ -82,6 +83,15 @@ class JsonRepository:
                 self.profiles[p["session_id"]] = p
         self.watchlist: list[dict] = self._load("db_watchlist_items.json")
         self._watchlist_path = PROCESSED_DIR / "db_watchlist_items.json"
+        self.stats_by_id = {
+            s["grant_program_id"]: s for s in self._load("db_grant_program_stats.json")
+        }
+        self.insights_by_program: dict[str, list[dict]] = {}
+        for ins in self._load("db_grant_insights.json"):
+            self.insights_by_program.setdefault(ins["grant_program_id"], []).append(ins)
+        for p in self.programs:
+            if p["id"] in self.stats_by_id:
+                p["stats"] = self.stats_by_id[p["id"]]
 
     @staticmethod
     def _load(name: str) -> list[dict]:
@@ -361,6 +371,13 @@ class JsonRepository:
         ]
         self._watchlist_path.write_text(json.dumps(self.watchlist, indent=2))
         return {"ok": True}
+
+    async def ask_grants(self, question: str, profile: Optional[dict]) -> dict:
+        recent = self._recent_program_ids()
+        return answer_grant_question(
+            question, profile, self.programs, recent,
+            self.stats_by_id, self.insights_by_program,
+        )
 
 
 # ===========================================================================
@@ -767,6 +784,21 @@ class PgRepository:
             session_id, entity_type, entity_id,
         )
         return {"ok": True}
+
+    async def ask_grants(self, question: str, profile: Optional[dict]) -> dict:
+        await self._ensure_caches()
+        stats_rows = await self.pool.fetch("SELECT * FROM grant_program_stats")
+        stats_by_id = {str(r["grant_program_id"]): self._row(r) for r in stats_rows}
+        insight_rows = await self.pool.fetch("SELECT * FROM grant_insights")
+        insights_by_program: dict[str, list[dict]] = {}
+        for r in insight_rows:
+            pid = str(r["grant_program_id"])
+            insights_by_program.setdefault(pid, []).append(self._row(r))
+        recent = await self._recent_program_ids()
+        return answer_grant_question(
+            question, profile, self._programs_cache or [], recent,
+            stats_by_id, insights_by_program,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from db import close_repo, get_repo
-from routes import awards, dashboard, pipeline, programs, recipients, watchlist
+from routes import ask, awards, dashboard, pipeline, programs, recipients, watchlist
 
 from pathlib import Path
 
@@ -60,6 +60,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(ask.router)
 app.include_router(programs.router)
 app.include_router(awards.router)
 app.include_router(recipients.router)

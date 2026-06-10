@@ -1,5 +1,7 @@
 """Run the full pipeline end-to-end: ingest -> clean -> enrich -> normalize -> load.
 
+Load stage also runs: stats -> knowledge -> index_search (FTS + embeddings).
+
 Usage:
     python pipeline/run_all.py
     FORCE_INGEST=1 python pipeline/run_all.py   # re-download raw sources

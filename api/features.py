@@ -190,10 +190,20 @@ def _program_passes_filters(
                     program.get("name"),
                     program.get("department"),
                     program.get("description"),
+                    program.get("short_description"),
+                    program.get("summary_1liner"),
+                    program.get("eligibility_narrative"),
+                    program.get("target_audience"),
+                    " ".join(program.get("keywords") or []),
                 ],
             )
         ).lower()
-        if q_lower not in haystack:
+        # Token match: any query word (3+ chars) hits haystack
+        tokens = [t for t in re.split(r"\W+", q_lower) if len(t) >= 3]
+        if tokens:
+            if not any(t in haystack for t in tokens):
+                return False
+        elif q_lower not in haystack:
             return False
 
     if sector:
@@ -549,6 +559,81 @@ def similar_recipients(
         })
     scored.sort(key=lambda x: (-x["similarity_score"], -x["total_amount"]))
     return scored[:limit]
+
+
+def answer_grant_question(
+    question: str,
+    profile: Optional[dict],
+    programs: list[dict],
+    recent_program_ids: set,
+    stats_by_id: dict[str, dict],
+    insights_by_program: dict[str, list[dict]],
+    *,
+    limit: int = 5,
+) -> dict:
+    """RAG-lite answer: hybrid search + stats citations (no LLM required)."""
+    matched, total = browse_programs(
+        programs,
+        recent_program_ids,
+        profile=profile,
+        q=question,
+        limit=limit,
+        offset=0,
+    )
+    if not matched:
+        return {
+            "answer": "I couldn't find grant programs matching that question. Try broadening your search or updating your company profile.",
+            "programs": [],
+            "citations": [],
+            "insights": [],
+            "total": 0,
+        }
+
+    lines = []
+    citations = []
+    insight_snippets = []
+    for p in matched:
+        stats = stats_by_id.get(p["id"])
+        summary = p.get("summary_1liner") or p.get("name")
+        line = f"• **{p['name']}** — {summary}"
+        if stats and stats.get("award_count", 0) > 0:
+            line += (
+                f" (${stats['total_disbursed']:,.0f} disbursed, "
+                f"{stats['award_count']} awards, median ${stats.get('median_award', 0):,.0f})"
+            )
+        if p.get("apply_url"):
+            line += f" [Apply]({p['apply_url']})"
+        lines.append(line)
+        citations.append({
+            "program_id": p["id"],
+            "name": p["name"],
+            "stats": stats,
+            "apply_url": p.get("apply_url"),
+        })
+        for ins in insights_by_program.get(p["id"], [])[:1]:
+            insight_snippets.append(ins.get("content"))
+
+    profile_hint = ""
+    if profile:
+        profile_hint = (
+            f"For your profile ({profile.get('sector', '')} in {profile.get('province', '')}, "
+            f"{profile.get('size_band', '')} employees), "
+        )
+
+    answer = (
+        f"{profile_hint}here are the top {len(matched)} programs matching "
+        f'"{question}":\n\n' + "\n".join(lines)
+    )
+    if insight_snippets:
+        answer += "\n\n**Insights:**\n" + "\n".join(f"• {s}" for s in insight_snippets[:3])
+
+    return {
+        "answer": answer,
+        "programs": matched,
+        "citations": citations,
+        "insights": insight_snippets,
+        "total": total,
+    }
 
 
 def program_naics_prefixes(awards: list[dict]) -> dict[str, list[str]]:
