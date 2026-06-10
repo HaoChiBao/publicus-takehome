@@ -53,15 +53,24 @@ app = FastAPI(
 # CORS — explicit origins required when allow_credentials=True (* is invalid).
 _default_origins = "http://localhost:3000,http://127.0.0.1:3000"
 _origins_env = os.getenv("CORS_ORIGINS", _default_origins)
-origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
-allow_credentials = "*" not in origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins if origins else _default_origins.split(","),
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+origins = [o.strip() for o in _origins_env.split(",") if o.strip() and o.strip() != "*"]
+if "*" in _origins_env:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins or _default_origins.split(","),
+        allow_origin_regex=r"https://.*\.vercel\.app",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 app.include_router(ask.router)
 app.include_router(programs.router)

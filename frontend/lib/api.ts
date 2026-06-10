@@ -1,6 +1,6 @@
 // Tiny typed fetch wrapper around the FastAPI backend.
 // Default "" uses Next.js rewrites (same-origin /api/* → backend) in local dev.
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, { cache: "no-store" });
