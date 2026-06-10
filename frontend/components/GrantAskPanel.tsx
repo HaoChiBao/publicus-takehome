@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Loader2, Sparkles } from "lucide-react";
 import { api, type GrantAskResult } from "@/lib/api";
+import { cachePrograms } from "@/lib/programCache";
 import ProgramCard from "@/components/ProgramCard";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -55,6 +56,7 @@ export default function GrantAskPanel({ sessionId }: { sessionId: string }) {
     setError(null);
     try {
       const res = await api.askGrants(text, sessionId);
+      cachePrograms(res.programs);
       setResult(res);
     } catch {
       setError("Could not run grant search. Is the API running?");

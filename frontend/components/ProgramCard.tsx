@@ -2,6 +2,7 @@ import Link from "next/link";
 import { ArrowUpRight } from "lucide-react";
 import type { Program } from "@/lib/api";
 import { amountRange, formatCurrency } from "@/lib/format";
+import { cacheProgram } from "@/lib/programCache";
 import MatchScore from "@/components/MatchScore";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -20,8 +21,16 @@ export default function ProgramCard({
   const stats = p.stats;
   const hasAwardHistory = (stats?.award_count ?? 0) > 0;
 
+  if (!p.id) {
+    return null;
+  }
+
   return (
-    <Link href={`/program/${p.id}`} className="block">
+    <Link
+      href={`/program/${p.id}`}
+      className="block"
+      onClick={() => cacheProgram(p)}
+    >
       <Card className="transition-colors hover:border-foreground">
         <CardContent className={compact ? "space-y-2 p-4" : "space-y-3 p-4"}>
           <div className="flex items-start justify-between gap-3">

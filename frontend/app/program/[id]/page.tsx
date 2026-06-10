@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
@@ -19,6 +20,10 @@ import {
 } from "@/lib/api";
 import { amountRange, formatCurrency, formatCurrencyFull } from "@/lib/format";
 import { sectorLabel } from "@/lib/constants";
+import {
+  normalizeProgram,
+  readCachedProgram,
+} from "@/lib/programCache";
 import ReadinessChecklist from "@/components/ReadinessChecklist";
 import RecipientTable from "@/components/RecipientTable";
 import WatchlistButton from "@/components/WatchlistButton";
@@ -28,11 +33,15 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 
-export default function ProgramDetailPage({
-  params,
-}: {
-  params: { id: string };
-}) {
+export default function ProgramDetailPage() {
+  const routeParams = useParams();
+  const programId =
+    typeof routeParams.id === "string"
+      ? routeParams.id
+      : Array.isArray(routeParams.id)
+        ? routeParams.id[0]
+        : "";
+
   const [program, setProgram] = useState<Program | null>(null);
   const [awards, setAwards] = useState<Award[]>([]);
   const [total, setTotal] = useState(0);
@@ -40,27 +49,61 @@ export default function ProgramDetailPage({
   const [readiness, setReadiness] = useState<ReadinessResult | null>(null);
   const [overlapFlags, setOverlapFlags] = useState<OverlapFlag[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!programId) return;
+
+    setLoading(true);
+    setError(null);
+    setReadiness(null);
+    setOverlapFlags([]);
+
+    const cached = readCachedProgram(programId);
+    if (cached) {
+      setProgram(normalizeProgram(cached));
+    } else {
+      setProgram(null);
+    }
+    setAwards([]);
+    setTotal(0);
+    setInsights([]);
+
     const session = localStorage.getItem("publicus_session");
-    api
-      .programAwards(params.id, 200)
-      .then((d) => {
-        setProgram(d.program);
-        setAwards(d.awards);
-        setTotal(d.total);
-        if (d.insights?.length) setInsights(d.insights);
+
+    Promise.all([
+      api.getProgram(programId).catch(() => null),
+      api.programAwards(programId, 200).catch(() => null),
+    ])
+      .then(([programRes, awardsRes]) => {
+        const resolved =
+          programRes?.program ?? awardsRes?.program ?? cached ?? null;
+        if (!resolved) {
+          setError("Program not found.");
+          return;
+        }
+        setProgram(normalizeProgram(resolved));
+        if (awardsRes) {
+          setAwards(awardsRes.awards);
+          setTotal(awardsRes.total);
+        }
+        const insightList =
+          programRes?.insights ?? awardsRes?.insights ?? [];
+        if (insightList.length) setInsights(insightList);
       })
-      .catch(() => setError("Program not found."));
+      .catch(() => {
+        if (!cached) setError("Could not load this program. Try again.");
+      })
+      .finally(() => setLoading(false));
 
     if (session) {
-      api.programReadiness(params.id, session).then(setReadiness).catch(() => {});
+      api.programReadiness(programId, session).then(setReadiness).catch(() => {});
       api
-        .programOverlap(params.id, session)
+        .programOverlap(programId, session)
         .then((d) => setOverlapFlags(d.flags))
         .catch(() => {});
     }
-  }, [params.id]);
+  }, [programId]);
 
   const precomputed = program?.stats;
 
@@ -104,17 +147,26 @@ export default function ProgramDetailPage({
     [precomputed, liveStats]
   );
 
-  if (error)
+  if (!programId || (error && !program))
     return (
-      <p className="text-center text-sm font-medium text-destructive">{error}</p>
+      <p className="text-center text-sm font-medium text-destructive">
+        {error || "Invalid program link."}
+      </p>
     );
 
-  if (!program)
+  if (loading && !program)
     return (
       <div className="space-y-6">
         <Skeleton className="h-48 w-full" />
         <Skeleton className="h-64 w-full" />
       </div>
+    );
+
+  if (!program)
+    return (
+      <p className="text-center text-sm font-medium text-destructive">
+        Program not found.
+      </p>
     );
 
   const maxYear = Math.max(...stats.byYear.map((y) => y.total), 1);
@@ -163,7 +215,7 @@ export default function ProgramDetailPage({
               )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <WatchlistButton entityType="program" entityId={params.id} />
+              <WatchlistButton entityType="program" entityId={programId} />
               {program.apply_url && (
                 <a
                   href={program.apply_url}
@@ -463,6 +515,22 @@ function median(values: number[]): number {
     : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+function parseFiscalYears(
+  raw: ProgramStats["award_by_fiscal_year"]
+): { year: string; total: number }[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 function mergeStats(
   precomputed: ProgramStats | undefined,
   live: {
@@ -475,6 +543,7 @@ function mergeStats(
     awardCount: number;
   }
 ) {
+  const precomputedYears = parseFiscalYears(precomputed?.award_by_fiscal_year);
   if (precomputed?.award_count) {
     return {
       totalDisbursed: precomputed.total_disbursed ?? live.totalDisbursed,
@@ -482,10 +551,7 @@ function mergeStats(
       avg: precomputed.avg_award ?? live.avg,
       median: precomputed.median_award ?? live.median,
       largest: precomputed.largest_award ?? live.largest,
-      byYear:
-        precomputed.award_by_fiscal_year?.length
-          ? precomputed.award_by_fiscal_year
-          : live.byYear,
+      byYear: precomputedYears.length ? precomputedYears : live.byYear,
       awardCount: precomputed.award_count ?? live.awardCount,
     };
   }

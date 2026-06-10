@@ -83,6 +83,19 @@ async def naics_lookup(q: str = ""):
     return {"codes": lookup_naics(q)}
 
 
+@router.get("/{program_id}")
+async def get_program(program_id: str):
+    """Program catalogue record with stats and insights (no award history)."""
+    repo = await get_repo()
+    detail = await repo.program_detail(program_id, limit=0, offset=0)
+    if detail["program"] is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    return {
+        "program": detail["program"],
+        "insights": detail.get("insights") or [],
+    }
+
+
 @router.get("/{program_id}/insights")
 async def program_insights(program_id: str):
     """Precomputed funding benchmarks and eligibility insights for a program."""

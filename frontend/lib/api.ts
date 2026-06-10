@@ -266,9 +266,14 @@ export const api = {
       session_id: sessionId,
     }),
 
+  getProgram: (id: string) =>
+    get<{ program: Program; insights: ProgramInsight[] }>(
+      `/api/programs/${encodeURIComponent(id)}`
+    ),
+
   programAwards: (id: string, limit = 25, offset = 0) =>
     get<{ program: Program; awards: Award[]; total: number; insights?: ProgramInsight[] }>(
-      `/api/awards/program/${id}?limit=${limit}&offset=${offset}`
+      `/api/awards/program/${encodeURIComponent(id)}?limit=${limit}&offset=${offset}`
     ),
 
   programInsights: (id: string) =>

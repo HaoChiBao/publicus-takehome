@@ -215,10 +215,16 @@ class JsonRepository:
         }
 
     async def program_detail(self, program_id: str, limit: int, offset: int) -> dict:
-        program = next((p for p in self.programs if p["id"] == program_id), None)
+        program = next(
+            (p for p in self.programs if str(p.get("id")) == str(program_id)),
+            None,
+        )
         if program is None:
             return {"program": None, "awards": [], "total": 0, "insights": []}
-        awards = [a for a in self._latest_awards() if a.get("program_id") == program_id]
+        awards = [
+            a for a in self._latest_awards()
+            if str(a.get("program_id")) == str(program_id)
+        ]
         awards.sort(key=lambda a: a.get("amount") or 0, reverse=True)
         total = len(awards)
         page = awards[offset:offset + limit]
