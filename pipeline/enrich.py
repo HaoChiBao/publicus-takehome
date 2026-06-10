@@ -305,8 +305,18 @@ def _pick_column(df: pd.DataFrame, *candidates: str) -> pd.Series:
     return pd.Series([""] * len(df), index=df.index)
 
 
+def _pick_column_fuzzy(df: pd.DataFrame, *substrings: str) -> pd.Series:
+    """Pick the first column whose normalized name contains all substrings."""
+    for col in df.columns:
+        key = str(col).lower()
+        if all(s in key for s in substrings):
+            return df[col].fillna("").astype(str)
+    return pd.Series([""] * len(df), index=df.index)
+
+
 def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Map Innovation Canada / BBF export columns to our canonical schema."""
+    df = df.copy()
     df.columns = [
         str(c).strip().lower().replace(" ", "_").replace("(", "").replace(")", "")
         for c in df.columns
@@ -323,6 +333,8 @@ def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
         "program_title_en",
         "program_name_en",
     )
+    if name.str.strip().eq("").all():
+        name = _pick_column_fuzzy(df, "title", "english")
     department = _pick_column(
         df,
         "department",
@@ -333,6 +345,8 @@ def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
         "owner_org",
         "administering_department",
     )
+    if department.str.strip().eq("").all():
+        department = _pick_column_fuzzy(df, "organization", "english")
     description = _pick_column(
         df,
         "description",
@@ -343,6 +357,8 @@ def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
         "program_description_en",
         "short_description",
     )
+    if description.str.strip().eq("").all():
+        description = _pick_column_fuzzy(df, "description", "english")
     apply_url = _pick_column(
         df,
         "apply_url",
@@ -354,6 +370,8 @@ def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
         "application_url",
         "business_benefits_finder_link",
     )
+    if apply_url.str.strip().eq("").all():
+        apply_url = _pick_column_fuzzy(df, "organization", "url", "english")
     deadline = _pick_column(df, "deadline", "application_deadline", "closing_date")
     status = _pick_column(df, "status", "program_status", "availability")
 
@@ -367,7 +385,11 @@ def _normalize_bbf_columns(df: pd.DataFrame) -> pd.DataFrame:
             "status": status.str.strip(),
         }
     )
-    out = out[out["name"] != ""].reset_index(drop=True)
+    template_markers = ("titre -", "title -", "description courte", "short description")
+    mask = out["name"].str.lower().apply(
+        lambda s: not any(m in s for m in template_markers)
+    )
+    out = out[mask & (out["name"] != "")].reset_index(drop=True)
     return out
 
 

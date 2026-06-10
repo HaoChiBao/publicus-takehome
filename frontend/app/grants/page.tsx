@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Search } from "lucide-react";
 import { api, type Program } from "@/lib/api";
@@ -25,9 +25,10 @@ const PAGE_SIZE = 20;
 
 export default function GrantsBrowsePage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [sessionId, setSessionId] = useState<string | null>(null);
 
-  const [q, setQ] = useState("");
+  const [q, setQ] = useState(() => searchParams.get("q") ?? "");
   const [sector, setSector] = useState("");
   const [province, setProvince] = useState("");
   const [sizeBand, setSizeBand] = useState("");

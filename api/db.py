@@ -31,16 +31,21 @@ from features import (
     similar_recipients,
 )
 
-load_dotenv()
-
 ROOT = Path(__file__).resolve().parent.parent
+load_dotenv()
+load_dotenv(ROOT / ".env.local", override=True)
+
 PROCESSED_DIR = ROOT / "data" / "processed"
+
+log = __import__("logging").getLogger("api.db")
 
 
 # ===========================================================================
 # JSON snapshot backend
 # ===========================================================================
 class JsonRepository:
+    backend = "json-snapshot"
+
     REQUIRED_SNAPSHOTS = (
         "db_grant_programs.json",
         "db_grant_awards.json",
@@ -362,12 +367,12 @@ class JsonRepository:
 # Postgres backend
 # ===========================================================================
 class PgRepository:
+    backend = "postgres"
+
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
         self.pool = None
         self._programs_cache: Optional[list[dict]] = None
-        self._summaries_cache: Optional[dict[str, dict]] = None
-        self._watchlist_path = PROCESSED_DIR / "db_watchlist_items.json"
 
     async def connect(self):
         import asyncpg
@@ -375,41 +380,39 @@ class PgRepository:
         return self
 
     async def _ensure_caches(self):
-        if self._programs_cache is not None:
+        count = int(await self.pool.fetchval("SELECT COUNT(*) FROM grant_programs") or 0)
+        if self._programs_cache and len(self._programs_cache) == count:
+            return
+        self._programs_cache = None
+        if count == 0:
+            self._programs_cache = []
             return
         rows = await self.pool.fetch("SELECT * FROM grant_programs")
         programs = [self._row(r) for r in rows]
-        award_rows = await self.pool.fetch(
-            "SELECT program_id, naics_code, is_latest_amendment FROM grant_awards "
-            "WHERE program_id IS NOT NULL AND naics_code IS NOT NULL"
-        )
-        awards_stub = [self._row(r) for r in award_rows]
-        naics_by_prog = program_naics_prefixes(awards_stub)
+        naics_by_prog: dict[str, list[str]] = {}
+        award_count = int(await self.pool.fetchval("SELECT COUNT(*) FROM grant_awards") or 0)
+        if award_count:
+            prefix_rows = await self.pool.fetch(
+                "SELECT program_id, LEFT(naics_code, 4) AS prefix "
+                "FROM grant_awards "
+                "WHERE program_id IS NOT NULL AND naics_code IS NOT NULL AND is_latest_amendment "
+                "GROUP BY program_id, LEFT(naics_code, 4)"
+            )
+            for r in prefix_rows:
+                pid = str(r["program_id"])
+                prefix = str(r["prefix"])
+                bucket = naics_by_prog.setdefault(pid, [])
+                if prefix not in bucket:
+                    bucket.append(prefix)
+            for pid in naics_by_prog:
+                naics_by_prog[pid] = sorted(naics_by_prog[pid])
         self._programs_cache = [
             enrich_program(p, naics_by_prog.get(p["id"], [])) for p in programs
         ]
-        rec_rows = await self.pool.fetch("SELECT * FROM recipients")
-        recipients = [self._row(r) for r in rec_rows]
-        all_awards = await self.pool.fetch(
-            "SELECT recipient_id, sector_normalized, province, naics_code, "
-            "program_id, amount, is_latest_amendment FROM grant_awards"
-        )
-        self._summaries_cache = build_recipient_summaries(
-            recipients, [self._row(a) for a in all_awards]
-        )
 
     async def _programs_by_id(self) -> dict[str, dict]:
         await self._ensure_caches()
         return {p["id"]: p for p in self._programs_cache}
-
-    def _load_watchlist(self) -> list[dict]:
-        if self._watchlist_path.exists():
-            return json.loads(self._watchlist_path.read_text())
-        return []
-
-    def _save_watchlist_file(self, items: list[dict]):
-        self._watchlist_path.parent.mkdir(parents=True, exist_ok=True)
-        self._watchlist_path.write_text(json.dumps(items, indent=2))
 
     async def close(self):
         if self.pool:
@@ -496,36 +499,36 @@ class PgRepository:
             return {"sector": sector, "province": province, "total_amount": 0,
                     "award_count": 0, "avg_amount": 0, "top_programs": [],
                     "by_fiscal_year": [], "top_recipients": []}
-        cond = ("sector_normalized = $1 AND fiscal_year = ANY($2::text[]) "
-                "AND is_latest_amendment AND amount IS NOT NULL")
+        cond = ("a.sector_normalized = $1 AND a.fiscal_year = ANY($2::text[]) "
+                "AND a.is_latest_amendment AND a.amount IS NOT NULL")
         args: list[Any] = [sector, fys]
         if province:
-            cond += " AND province = $3"
+            cond += " AND a.province = $3"
             args.append(province)
 
         agg = await self.pool.fetchrow(
-            f"SELECT COALESCE(SUM(amount),0) total, COUNT(*) cnt, COALESCE(AVG(amount),0) avg "
-            f"FROM grant_awards WHERE {cond}", *args)
+            f"SELECT COALESCE(SUM(a.amount),0) total, COUNT(*) cnt, COALESCE(AVG(a.amount),0) avg "
+            f"FROM grant_awards a WHERE {cond}", *args)
         top_programs = await self.pool.fetch(
-            f"SELECT program_name_raw name, SUM(amount) total, COUNT(*) count "
-            f"FROM grant_awards WHERE {cond} GROUP BY program_name_raw "
-            f"ORDER BY total DESC LIMIT 5", *args)
+            f"SELECT a.program_name_raw AS pname, SUM(a.amount) AS total_amt, COUNT(*) AS cnt "
+            f"FROM grant_awards a WHERE {cond} GROUP BY a.program_name_raw "
+            f"ORDER BY total_amt DESC LIMIT 5", *args)
         by_fy = await self.pool.fetch(
-            f"SELECT fiscal_year year, SUM(amount) total FROM grant_awards WHERE {cond} "
-            f"GROUP BY fiscal_year ORDER BY fiscal_year", *args)
+            f"SELECT a.fiscal_year AS fy, SUM(a.amount) AS total_amt FROM grant_awards a WHERE {cond} "
+            f"GROUP BY a.fiscal_year ORDER BY a.fiscal_year", *args)
         top_recipients = await self.pool.fetch(
-            f"SELECT r.name_normalized name, SUM(a.amount) total FROM grant_awards a "
+            f"SELECT r.name_normalized AS pname, SUM(a.amount) AS total_amt FROM grant_awards a "
             f"JOIN recipients r ON r.id = a.recipient_id WHERE {cond} "
-            f"GROUP BY r.name_normalized ORDER BY total DESC LIMIT 5", *args)
+            f"GROUP BY r.name_normalized ORDER BY total_amt DESC LIMIT 5", *args)
 
         return {
             "sector": sector, "province": province,
             "total_amount": float(agg["total"]), "award_count": agg["cnt"],
             "avg_amount": round(float(agg["avg"]), 2),
-            "top_programs": [{"name": r["name"], "total": float(r["total"]), "count": r["count"]}
+            "top_programs": [{"name": r["pname"], "total": float(r["total_amt"]), "count": r["cnt"]}
                              for r in top_programs],
-            "by_fiscal_year": [{"year": r["year"], "total": float(r["total"])} for r in by_fy],
-            "top_recipients": [{"name": r["name"], "total": float(r["total"])}
+            "by_fiscal_year": [{"year": r["fy"], "total": float(r["total_amt"])} for r in by_fy],
+            "top_recipients": [{"name": r["pname"], "total": float(r["total_amt"])}
                                for r in top_recipients],
         }
 
@@ -567,10 +570,14 @@ class PgRepository:
         if rrow is None:
             return {"recipient": None, "awards": [], "by_fiscal_year": []}
         awards = await self.pool.fetch(
-            "SELECT * FROM grant_awards WHERE recipient_id = $1 AND is_latest_amendment "
-            "ORDER BY fiscal_year DESC, amount DESC NULLS LAST", recipient_id)
+            "SELECT a.*, p.apply_url AS program_apply_url "
+            "FROM grant_awards a "
+            "LEFT JOIN grant_programs p ON p.id = a.program_id "
+            "WHERE a.recipient_id = $1 AND a.is_latest_amendment "
+            "ORDER BY a.fiscal_year DESC, amount DESC NULLS LAST", recipient_id)
         by_fy = await self.pool.fetch(
-            "SELECT fiscal_year year, SUM(amount) total, COUNT(*) count FROM grant_awards "
+            "SELECT fiscal_year AS fy, SUM(amount) AS total_amt, COUNT(*) AS cnt "
+            "FROM grant_awards "
             "WHERE recipient_id = $1 AND is_latest_amendment GROUP BY fiscal_year "
             "ORDER BY fiscal_year DESC", recipient_id)
         meta = await self.pool.fetchrow(
@@ -583,7 +590,7 @@ class PgRepository:
         return {
             "recipient": rec,
             "awards": [self._row(a) for a in awards],
-            "by_fiscal_year": [{"year": r["year"], "total": float(r["total"]), "count": r["count"]}
+            "by_fiscal_year": [{"year": r["fy"], "total": float(r["total_amt"]), "count": r["cnt"]}
                                for r in by_fy],
         }
 
@@ -642,15 +649,61 @@ class PgRepository:
             "SELECT * FROM pipeline_runs ORDER BY run_at DESC LIMIT $1", limit)
         return [self._row(r) for r in rows]
 
+    async def stats(self) -> dict[str, int]:
+        programs = await self.pool.fetchval("SELECT COUNT(*) FROM grant_programs")
+        recipients = await self.pool.fetchval("SELECT COUNT(*) FROM recipients")
+        awards = await self.pool.fetchval("SELECT COUNT(*) FROM grant_awards")
+        return {
+            "programs": int(programs or 0),
+            "recipients": int(recipients or 0),
+            "awards": int(awards or 0),
+        }
+
     async def get_alerts(self, profile: dict, days: int = 90) -> list[dict]:
         matches = await self.match_programs(profile, limit=50)
         return compute_alerts(matches, days)
 
     async def get_similar_recipients(self, profile: dict, limit: int = 8) -> list[dict]:
-        await self._ensure_caches()
-        return similar_recipients(
-            profile, self._summaries_cache, await self._programs_by_id(), limit
+        sector = profile.get("sector")
+        province = profile.get("province")
+        cond = ["a.is_latest_amendment"]
+        args: list[Any] = []
+        if sector:
+            args.append(sector)
+            cond.append(f"a.sector_normalized = ${len(args)}")
+        if province:
+            args.append(province)
+            cond.append(f"r.province = ${len(args)}")
+        where = " AND ".join(cond)
+        rows = await self.pool.fetch(
+            f"SELECT r.id, r.name_normalized name, r.province, r.city, "
+            f"COUNT(a.id) award_count, COALESCE(SUM(a.amount),0) total_amount, "
+            f"(ARRAY_AGG(a.sector_normalized ORDER BY a.amount DESC NULLS LAST) "
+            f" FILTER (WHERE a.sector_normalized IS NOT NULL))[1] primary_sector, "
+            f"(ARRAY_AGG(a.naics_code ORDER BY a.amount DESC NULLS LAST) "
+            f" FILTER (WHERE a.naics_code IS NOT NULL))[1] primary_naics, "
+            f"ARRAY_AGG(DISTINCT a.program_id) FILTER (WHERE a.program_id IS NOT NULL) program_ids "
+            f"FROM recipients r JOIN grant_awards a ON a.recipient_id = r.id "
+            f"WHERE {where} "
+            f"GROUP BY r.id HAVING COALESCE(SUM(a.amount),0) > 0 "
+            f"ORDER BY total_amount DESC LIMIT 200",
+            *args,
         )
+        summaries: dict[str, dict] = {}
+        for r in rows:
+            summaries[str(r["id"])] = {
+                "id": str(r["id"]),
+                "name": r["name"],
+                "province": r["province"],
+                "city": r["city"],
+                "primary_sector": r["primary_sector"],
+                "primary_naics": r["primary_naics"],
+                "award_count": r["award_count"],
+                "total_amount": float(r["total_amount"]),
+                "program_ids": [str(x) for x in (r["program_ids"] or [])],
+            }
+        programs_by_id = await self._programs_by_id()
+        return similar_recipients(profile, summaries, programs_by_id, limit)
 
     async def program_readiness(self, profile: dict, program_id: str) -> Optional[dict]:
         programs = await self._programs_by_id()
@@ -667,39 +720,52 @@ class PgRepository:
         return overlap_flags(profile, program, list(programs.values()))
 
     async def get_watchlist(self, session_id: str) -> dict:
-        items = [w for w in self._load_watchlist() if w["session_id"] == session_id]
+        rows = await self.pool.fetch(
+            "SELECT entity_type, entity_id FROM watchlist_items WHERE session_id = $1",
+            session_id,
+        )
         programs_by_id = await self._programs_by_id()
-        programs = [programs_by_id[w["entity_id"]] for w in items
-                    if w["entity_type"] == "program" and w["entity_id"] in programs_by_id]
-        await self._ensure_caches()
-        recipients = []
-        for w in items:
-            if w["entity_type"] != "recipient":
-                continue
-            s = self._summaries_cache.get(w["entity_id"])
-            if s:
-                recipients.append({
-                    "id": s["id"], "name": s["name"], "province": s.get("province"),
-                    "city": s.get("city"), "award_count": s["award_count"],
-                    "total_amount": s["total_amount"],
-                })
+        programs = [
+            programs_by_id[str(r["entity_id"])]
+            for r in rows
+            if r["entity_type"] == "program" and str(r["entity_id"]) in programs_by_id
+        ]
+        rec_rows = await self.pool.fetch(
+            "SELECT r.id, r.name_normalized name, r.province, r.city, "
+            "COUNT(a.id) award_count, COALESCE(SUM(a.amount), 0) total_amount "
+            "FROM watchlist_items w "
+            "JOIN recipients r ON r.id = w.entity_id "
+            "LEFT JOIN grant_awards a ON a.recipient_id = r.id AND a.is_latest_amendment "
+            "WHERE w.session_id = $1 AND w.entity_type = 'recipient' "
+            "GROUP BY r.id",
+            session_id,
+        )
+        recipients = [
+            {
+                "id": str(r["id"]),
+                "name": r["name"],
+                "province": r["province"],
+                "city": r["city"],
+                "award_count": r["award_count"],
+                "total_amount": float(r["total_amount"]),
+            }
+            for r in rec_rows
+        ]
         return {"programs": programs, "recipients": recipients}
 
     async def add_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
-        items = self._load_watchlist()
-        key = (session_id, entity_type, entity_id)
-        if not any((w["session_id"], w["entity_type"], w["entity_id"]) == key for w in items):
-            items.append({"session_id": session_id, "entity_type": entity_type, "entity_id": entity_id})
-            self._save_watchlist_file(items)
+        await self.pool.execute(
+            "INSERT INTO watchlist_items (session_id, entity_type, entity_id) "
+            "VALUES ($1, $2, $3) ON CONFLICT (session_id, entity_type, entity_id) DO NOTHING",
+            session_id, entity_type, entity_id,
+        )
         return {"ok": True}
 
     async def remove_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
-        items = [
-            w for w in self._load_watchlist()
-            if not (w["session_id"] == session_id and w["entity_type"] == entity_type
-                    and w["entity_id"] == entity_id)
-        ]
-        self._save_watchlist_file(items)
+        await self.pool.execute(
+            "DELETE FROM watchlist_items WHERE session_id = $1 AND entity_type = $2 AND entity_id = $3",
+            session_id, entity_type, entity_id,
+        )
         return {"ok": True}
 
 
@@ -714,8 +780,15 @@ async def get_repo():
     if _repo is None:
         dsn = os.getenv("DATABASE_URL")
         if dsn:
+            log.info("Connecting to Supabase/Postgres via DATABASE_URL")
             _repo = await PgRepository(dsn).connect()
+        elif os.getenv("SUPABASE_URL"):
+            raise RuntimeError(
+                "SUPABASE_URL is set but DATABASE_URL is missing. "
+                "Add the Session pooler Postgres URI to .env.local so the API reads from Supabase."
+            )
         else:
+            log.warning("DATABASE_URL not set — using local JSON snapshot in data/processed/")
             _repo = await JsonRepository().connect()
     return _repo
 
@@ -725,3 +798,9 @@ async def close_repo():
     if _repo is not None:
         await _repo.close()
         _repo = None
+
+
+def reset_repo_cache():
+    """Clear the singleton so the next request reconnects (e.g. after a DB reload)."""
+    global _repo
+    _repo = None

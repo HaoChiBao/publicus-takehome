@@ -36,11 +36,21 @@ export default function RecipientHistoryPage({
     api
       .recipientAwards(params.id)
       .then((d) => {
+        if (!d.recipient) {
+          setError("Recipient not found.");
+          return;
+        }
         setRecipient(d.recipient as unknown as RecipientDetail);
         setAwards(d.awards);
         setByYear(d.by_fiscal_year);
       })
-      .catch(() => setError("Recipient not found."));
+      .catch((err: Error) => {
+        setError(
+          err.message.includes("404")
+            ? "Recipient not found."
+            : "Could not load recipient. Try again."
+        );
+      });
   }, [params.id]);
 
   const topSectors = useMemo(() => {
@@ -164,9 +174,13 @@ export default function RecipientHistoryPage({
       )}
 
       <div>
-        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        <h2 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Award history
         </h2>
+        <p className="mb-3 text-sm text-muted-foreground">
+          Select an award to view reference numbers, dates, source links, and
+          related programs.
+        </p>
         <RecipientTable awards={awards} />
       </div>
     </div>

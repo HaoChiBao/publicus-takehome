@@ -1,8 +1,15 @@
 "use client";
 
+import Link from "next/link";
 import { Fragment, useState } from "react";
-import { ArrowUpDown, ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowUpDown, ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import type { Award } from "@/lib/api";
+import {
+  awardDescription,
+  awardExtraFields,
+  awardLinks,
+  hasAwardExtraInfo,
+} from "@/lib/awardDetails";
 import { formatCurrencyFull } from "@/lib/format";
 import { sectorLabel } from "@/lib/constants";
 import { cn } from "@/lib/utils";
@@ -17,11 +24,6 @@ import {
 } from "@/components/ui/table";
 
 type SortKey = "amount" | "fiscal_year";
-
-function fmtDate(d?: string | null) {
-  if (!d) return "—";
-  return d;
-}
 
 export default function RecipientTable({
   awards,
@@ -58,6 +60,9 @@ export default function RecipientTable({
 
   return (
     <div className="rounded-lg border">
+      <p className="border-b px-4 py-2 text-xs text-muted-foreground">
+        Click any row to see full award details, source links, and related programs.
+      </p>
       <Table>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
@@ -90,8 +95,12 @@ export default function RecipientTable({
             return (
               <Fragment key={a.id}>
                 <TableRow
-                  className="cursor-pointer"
+                  className={cn(
+                    "cursor-pointer transition-colors",
+                    open && "bg-muted/30"
+                  )}
                   onClick={() => setExpanded(open ? null : a.id)}
+                  aria-expanded={open}
                 >
                   <TableCell className="text-muted-foreground">
                     {open ? (
@@ -105,11 +114,11 @@ export default function RecipientTable({
                       {a.recipient_name || a.recipient_name_raw}
                     </TableCell>
                   )}
-                  <TableCell className="text-muted-foreground">
-                    {a.program_name_raw}
+                  <TableCell className="max-w-[220px] truncate text-muted-foreground">
+                    {a.program_name_raw || "—"}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {a.department}
+                    {a.department || "—"}
                   </TableCell>
                   <TableCell className="text-right font-medium tabular-nums">
                     {formatCurrencyFull(a.amount)}
@@ -121,29 +130,8 @@ export default function RecipientTable({
                 </TableRow>
                 {open && (
                   <TableRow className="hover:bg-transparent">
-                    <TableCell colSpan={colCount} className="bg-muted/40">
-                      <div className="grid grid-cols-2 gap-x-8 gap-y-3 px-2 py-1 text-sm sm:grid-cols-4">
-                        <Detail label="Agreement type" value={a.agreement_type} />
-                        <Detail
-                          label="Sector"
-                          value={a.sector_normalized ? sectorLabel(a.sector_normalized) : undefined}
-                        />
-                        <Detail label="NAICS" value={a.naics_code} />
-                        <Detail label="Source" value={a.source} />
-                        <Detail label="Start date" value={fmtDate(a.start_date)} />
-                        <Detail label="End date" value={fmtDate(a.end_date)} />
-                        <Detail label="City" value={a.city} />
-                        {a.description && (
-                          <div className="col-span-2 sm:col-span-4">
-                            <p className="text-xs uppercase tracking-wide text-muted-foreground">
-                              Description
-                            </p>
-                            <p className="mt-0.5 leading-relaxed">
-                              {a.description}
-                            </p>
-                          </div>
-                        )}
-                      </div>
+                    <TableCell colSpan={colCount} className="bg-muted/40 p-0">
+                      <AwardDetailPanel award={a} />
                     </TableCell>
                   </TableRow>
                 )}
@@ -192,13 +180,101 @@ export default function RecipientTable({
   );
 }
 
+function AwardDetailPanel({ award }: { award: Award }) {
+  const fields = awardExtraFields(award).map((f) =>
+    f.label === "Sector"
+      ? { ...f, value: sectorLabel(f.value) }
+      : f
+  );
+  const links = awardLinks(award);
+  const description = awardDescription(award);
+  const hasExtra = hasAwardExtraInfo(award);
+
+  return (
+    <div className="space-y-4 px-4 py-4">
+      <div>
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Award details
+        </p>
+        <p className="mt-1 font-medium leading-snug">
+          {award.program_name_raw || "Unknown program"}
+        </p>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          {formatCurrencyFull(award.amount)}
+          {award.fiscal_year ? ` · FY ${award.fiscal_year}` : ""}
+          {award.province ? ` · ${award.province}` : ""}
+        </p>
+      </div>
+
+      {fields.length > 0 && (
+        <div className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-3 lg:grid-cols-4">
+          {fields.map((f) => (
+            <Detail key={f.label} label={f.label} value={f.value} />
+          ))}
+        </div>
+      )}
+
+      {description && (
+        <div>
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Description
+          </p>
+          <p className="mt-1 text-sm leading-relaxed">{description}</p>
+        </div>
+      )}
+
+      {links.length > 0 && (
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Related links
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {links.map((link) =>
+              link.external ? (
+                <a
+                  key={link.href}
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium transition-colors hover:bg-muted"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {link.label}
+                  <ExternalLink className="size-3.5 shrink-0 opacity-60" />
+                </a>
+              ) : (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium transition-colors hover:bg-muted"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {link.label}
+                </Link>
+              )
+            )}
+          </div>
+        </div>
+      )}
+
+      {!hasExtra && (
+        <p className="text-sm text-muted-foreground">
+          No additional details are recorded for this award beyond the summary
+          shown in the table. Federal disclosure data typically includes
+          program, amount, fiscal year, and location only.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function Detail({ label, value }: { label: string; value?: string | null }) {
   return (
     <div className={cn(!value && "opacity-60")}>
       <p className="text-xs uppercase tracking-wide text-muted-foreground">
         {label}
       </p>
-      <p className="mt-0.5 tabular-nums">{value || "—"}</p>
+      <p className="mt-0.5 text-sm tabular-nums">{value || "—"}</p>
     </div>
   );
 }

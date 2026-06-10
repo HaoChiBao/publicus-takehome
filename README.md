@@ -42,9 +42,12 @@ python pipeline/run_all.py
 # Windows shortcut:
 # .\scripts\run_pipeline.ps1
 
-# 3. Start the API (serves the JSON snapshot when DATABASE_URL is unset)
-cd api && python -m uvicorn main:app --reload --port 8000
-#    -> http://localhost:8000/api/health  (check program count)
+# 3. Start the API (uses Supabase when DATABASE_URL is set in .env.local)
+.\scripts\run_api.ps1
+#    -> http://localhost:8000/api/health  (backend should be "postgres")
+#
+# Or manually: cd api && python -m uvicorn main:app --reload --port 8000
+# If port 8000 is busy, run_api.ps1 stops the stale process automatically.
 
 # 4. Start the frontend (new terminal)
 cd frontend && cp .env.local.example .env.local && npm install && npm run dev

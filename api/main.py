@@ -17,14 +17,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from db import close_repo, get_repo
 from routes import awards, dashboard, pipeline, programs, recipients, watchlist
 
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv()
+load_dotenv(_ROOT / ".env.local", override=True)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await get_repo()      # warm the connection pool / load the snapshot
+    repo = await get_repo()
+    backend = getattr(repo, "backend", "unknown")
+    if backend == "postgres" and hasattr(repo, "stats"):
+        counts = await repo.stats()
+        log.info(
+            "API ready — Supabase/Postgres (%s programs, %s recipients, %s awards)",
+            counts["programs"], counts["recipients"], counts["awards"],
+        )
+    else:
+        log.info("API ready — backend=%s", backend)
     yield
     await close_repo()
+
+
+log = __import__("logging").getLogger("api.main")
 
 
 app = FastAPI(
@@ -59,29 +75,34 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    backend = "postgres" if os.getenv("DATABASE_URL") else "json-snapshot"
     try:
         repo = await get_repo()
-        if backend == "json-snapshot":
-            programs = len(getattr(repo, "programs", []))
-            awards = len(getattr(repo, "awards", []))
-            recipients = len(getattr(repo, "recipients", []))
-            payload = {
-                "status": "ok" if getattr(repo, "data_ready", True) else "no_data",
+        backend = getattr(repo, "backend", "unknown")
+        if backend == "postgres" and hasattr(repo, "stats"):
+            counts = await repo.stats()
+            return {
+                "status": "ok",
                 "backend": backend,
-                "programs": programs,
-                "awards": awards,
-                "recipients": recipients,
+                **counts,
             }
-            if getattr(repo, "data_error", None):
-                payload["error"] = repo.data_error
-                payload["hint"] = "Run `python pipeline/run_all.py` to download and process grants data."
-            return payload
-        return {"status": "ok", "backend": backend}
+        programs = len(getattr(repo, "programs", []))
+        awards = len(getattr(repo, "awards", []))
+        recipients = len(getattr(repo, "recipients", []))
+        payload = {
+            "status": "ok" if getattr(repo, "data_ready", True) else "no_data",
+            "backend": backend,
+            "programs": programs,
+            "awards": awards,
+            "recipients": recipients,
+        }
+        if getattr(repo, "data_error", None):
+            payload["error"] = repo.data_error
+            payload["hint"] = "Run `python pipeline/run_all.py` or set DATABASE_URL for Supabase."
+        return payload
     except Exception as e:
         return {
-            "status": "no_data",
-            "backend": backend,
+            "status": "error",
+            "backend": "postgres" if os.getenv("DATABASE_URL") else "json-snapshot",
             "error": str(e),
-            "hint": "Run `python pipeline/run_all.py` to download and process grants data.",
+            "hint": "Set DATABASE_URL in .env.local to your Supabase Session pooler URI.",
         }

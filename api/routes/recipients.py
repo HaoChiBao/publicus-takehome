@@ -1,6 +1,7 @@
 """Recipient search + full award history routes (the competitor-intel views)."""
 from __future__ import annotations
 
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -8,6 +9,13 @@ from fastapi import APIRouter, HTTPException
 from db import get_repo
 
 router = APIRouter(prefix="/api/recipients", tags=["recipients"])
+
+
+def _parse_recipient_id(recipient_id: str) -> str:
+    try:
+        return str(uuid.UUID(recipient_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Recipient not found") from exc
 
 
 @router.get("/search")
@@ -31,6 +39,7 @@ async def similar_recipients(session_id: str):
 @router.get("/{recipient_id}/awards")
 async def recipient_awards(recipient_id: str):
     """Complete award history for a recipient, grouped by fiscal year."""
+    recipient_id = _parse_recipient_id(recipient_id)
     repo = await get_repo()
     result = await repo.recipient_awards(recipient_id)
     if result["recipient"] is None:

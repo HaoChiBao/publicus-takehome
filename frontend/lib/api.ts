@@ -62,7 +62,9 @@ export interface Award {
   recipient_id?: string;
   recipient_name?: string;
   recipient_name_raw?: string;
+  program_id?: string | null;
   program_name_raw?: string;
+  program_name_normalized?: string;
   department?: string;
   agreement_type?: string;
   amount?: number | null;
@@ -75,6 +77,10 @@ export interface Award {
   end_date?: string | null;
   description?: string;
   source?: string;
+  ref_number?: string | null;
+  amendment_number?: number;
+  is_latest_amendment?: boolean;
+  program_apply_url?: string | null;
 }
 export interface SectorSummary {
   sector: string;

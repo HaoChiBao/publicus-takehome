@@ -17,12 +17,13 @@ from typing import Any, Callable, Iterable, Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv()  # .env
+load_dotenv(ROOT / ".env.local", override=True)  # local overrides (Supabase keys, etc.)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 CACHE_DIR = DATA_DIR / "cache"
