@@ -44,6 +44,33 @@ PROCESSED_DIR = ROOT / "data" / "processed"
 log = __import__("logging").getLogger("api.db")
 
 
+def _select_recent_fiscal_years(
+    rows: list[Any],
+    n: int,
+    *,
+    fy_key: str = "fiscal_year",
+    cnt_key: str = "cnt",
+) -> list[str]:
+    """Pick the n most recent fiscal years, skipping sparse incomplete tail years."""
+    if not rows:
+        return []
+    qualified = list(rows)
+    while len(qualified) > n and qualified[0][cnt_key] < qualified[1][cnt_key] * 0.2:
+        qualified = qualified[1:]
+    picked = qualified[:n]
+    return [r[fy_key] for r in reversed(picked)]
+
+
+def _sector_match_sql(sector_param: str, *, broad: bool = False) -> str:
+    """Match awards by normalized sector; optionally include program eligibility."""
+    if not broad:
+        return f"a.sector_normalized = {sector_param}"
+    return (
+        f"(a.sector_normalized = {sector_param} OR a.program_id IN ("
+        f"SELECT id FROM grant_programs WHERE {sector_param} = ANY(eligible_sectors)))"
+    )
+
+
 # ===========================================================================
 # JSON snapshot backend
 # ===========================================================================
@@ -116,8 +143,17 @@ class JsonRepository:
 
     # --- helpers ---
     def _recent_fiscal_years(self, n: int = 2) -> list[str]:
-        years = sorted({a.get("fiscal_year") for a in self.awards if a.get("fiscal_year")})
-        return years[-n:] if years else []
+        counts: dict[str, int] = {}
+        for a in self.awards:
+            if a.get("is_latest_amendment") and a.get("fiscal_year"):
+                fy = str(a["fiscal_year"])
+                counts[fy] = counts.get(fy, 0) + 1
+        rows = sorted(
+            [{"fiscal_year": fy, "cnt": cnt} for fy, cnt in counts.items()],
+            key=lambda r: r["fiscal_year"],
+            reverse=True,
+        )
+        return _select_recent_fiscal_years(rows, n)
 
     def _recent_program_ids(self, n: int = 2) -> set:
         years = set(self._recent_fiscal_years(n))
@@ -175,13 +211,28 @@ class JsonRepository:
         )
         return {"programs": programs, "total": total}
 
+    def _award_matches_sector(self, award: dict, sector: str) -> bool:
+        if award.get("sector_normalized") == sector:
+            return True
+        pid = award.get("program_id")
+        if not pid:
+            return False
+        prog = next((p for p in self.programs if str(p.get("id")) == str(pid)), None)
+        return bool(prog and sector in (prog.get("eligible_sectors") or []))
+
     async def sector_summary(self, sector: str, province: Optional[str], years: int = 2) -> dict:
         recent = set(self._recent_fiscal_years(years))
         rows = [a for a in self._latest_awards()
-                if a.get("sector_normalized") == sector
+                if self._award_matches_sector(a, sector)
                 and a.get("fiscal_year") in recent
                 and a.get("amount") is not None
                 and (province is None or a.get("province") == province)]
+        if not rows and province:
+            rows = [a for a in self._latest_awards()
+                    if self._award_matches_sector(a, sector)
+                    and a.get("fiscal_year") in recent
+                    and a.get("amount") is not None]
+            province = None
         total = sum(a["amount"] for a in rows)
         count = len(rows)
 
@@ -291,8 +342,12 @@ class JsonRepository:
         prev_fy, latest_fy = years[0], years[1]
         rows = [a for a in self._latest_awards()
                 if a.get("amount") is not None
-                and (sector is None or a.get("sector_normalized") == sector)
+                and (sector is None or self._award_matches_sector(a, sector))
                 and (province is None or a.get("province") == province)]
+        if not rows and province and sector:
+            rows = [a for a in self._latest_awards()
+                    if a.get("amount") is not None
+                    and self._award_matches_sector(a, sector)]
         prog_name = {p["id"]: p["name"] for p in self.programs}
         agg: dict[str, dict] = {}
         for a in rows:
@@ -491,9 +546,11 @@ class PgRepository:
 
     async def _recent_fiscal_years(self, n: int = 2) -> list[str]:
         rows = await self.pool.fetch(
-            "SELECT DISTINCT fiscal_year FROM grant_awards "
-            "WHERE fiscal_year IS NOT NULL ORDER BY fiscal_year DESC LIMIT $1", n)
-        return [r["fiscal_year"] for r in rows][::-1]
+            "SELECT fiscal_year, COUNT(*) AS cnt FROM grant_awards "
+            "WHERE fiscal_year IS NOT NULL AND is_latest_amendment "
+            "GROUP BY fiscal_year ORDER BY fiscal_year DESC LIMIT 10"
+        )
+        return _select_recent_fiscal_years(rows, n)
 
     async def _recent_program_ids(self, n: int = 2) -> set:
         years = await self._recent_fiscal_years(n)
@@ -564,14 +621,18 @@ class PgRepository:
         )
         return {"programs": programs, "total": total}
 
-    async def sector_summary(self, sector: str, province: Optional[str], years: int = 2) -> dict:
-        fys = await self._recent_fiscal_years(years)
-        if not fys:
-            return {"sector": sector, "province": province, "total_amount": 0,
-                    "award_count": 0, "avg_amount": 0, "top_programs": [],
-                    "by_fiscal_year": [], "top_recipients": []}
-        cond = ("a.sector_normalized = $1 AND a.fiscal_year = ANY($2::text[]) "
-                "AND a.is_latest_amendment AND a.amount IS NOT NULL")
+    async def _sector_summary_query(
+        self,
+        sector: str,
+        province: Optional[str],
+        fys: list[str],
+        *,
+        broad: bool = False,
+    ) -> dict:
+        cond = (
+            f"{_sector_match_sql('$1', broad=broad)} AND a.fiscal_year = ANY($2::text[]) "
+            "AND a.is_latest_amendment AND a.amount IS NOT NULL"
+        )
         args: list[Any] = [sector, fys]
         if province:
             cond += " AND a.province = $3"
@@ -587,21 +648,51 @@ class PgRepository:
         by_fy = await self.pool.fetch(
             f"SELECT a.fiscal_year AS fy, SUM(a.amount) AS total_amt FROM grant_awards a WHERE {cond} "
             f"GROUP BY a.fiscal_year ORDER BY a.fiscal_year", *args)
-        top_recipients = await self.pool.fetch(
-            f"SELECT r.name_normalized AS pname, SUM(a.amount) AS total_amt FROM grant_awards a "
-            f"JOIN recipients r ON r.id = a.recipient_id WHERE {cond} "
-            f"GROUP BY r.name_normalized ORDER BY total_amt DESC LIMIT 5", *args)
+        top_recipients: list[Any] = []
+        try:
+            top_recipients = await self.pool.fetch(
+                f"SELECT r.name_normalized AS pname, SUM(a.amount) AS total_amt FROM grant_awards a "
+                f"JOIN recipients r ON r.id = a.recipient_id WHERE {cond} "
+                f"GROUP BY r.name_normalized ORDER BY total_amt DESC LIMIT 5", *args)
+        except Exception as exc:
+            log.warning("sector_summary top_recipients skipped: %s", exc)
 
         return {
-            "sector": sector, "province": province,
-            "total_amount": float(agg["total"]), "award_count": agg["cnt"],
+            "sector": sector,
+            "province": province,
+            "total_amount": float(agg["total"]),
+            "award_count": agg["cnt"],
             "avg_amount": round(float(agg["avg"]), 2),
-            "top_programs": [{"name": r["pname"], "total": float(r["total_amt"]), "count": r["cnt"]}
-                             for r in top_programs],
-            "by_fiscal_year": [{"year": r["fy"], "total": float(r["total_amt"])} for r in by_fy],
-            "top_recipients": [{"name": r["pname"], "total": float(r["total_amt"])}
-                               for r in top_recipients],
+            "top_programs": [
+                {"name": r["pname"], "total": float(r["total_amt"]), "count": r["cnt"]}
+                for r in top_programs
+            ],
+            "by_fiscal_year": [
+                {"year": r["fy"], "total": float(r["total_amt"])} for r in by_fy
+            ],
+            "top_recipients": [
+                {"name": r["pname"], "total": float(r["total_amt"])} for r in top_recipients
+            ],
         }
+
+    async def sector_summary(self, sector: str, province: Optional[str], years: int = 2) -> dict:
+        fys = await self._recent_fiscal_years(years)
+        empty = {
+            "sector": sector, "province": province, "total_amount": 0,
+            "award_count": 0, "avg_amount": 0, "top_programs": [],
+            "by_fiscal_year": [], "top_recipients": [],
+        }
+        if not fys:
+            return empty
+
+        for prov in ([province] if province else [None]):
+            for broad in (False, True):
+                result = await self._sector_summary_query(sector, prov, fys, broad=broad)
+                if result["award_count"] > 0:
+                    return result
+        if province:
+            return await self._sector_summary_query(sector, None, fys, broad=False)
+        return empty
 
     async def program_detail(self, program_id: str, limit: int, offset: int) -> dict:
         prow = await self.pool.fetchrow("SELECT * FROM grant_programs WHERE id = $1", program_id)
@@ -688,20 +779,40 @@ class PgRepository:
         if len(fys) < 2:
             return []
         prev_fy, latest_fy = fys[0], fys[1]
-        cond = "is_latest_amendment AND amount IS NOT NULL AND program_id IS NOT NULL"
+        cond = (
+            "a.is_latest_amendment AND a.amount IS NOT NULL AND a.program_id IS NOT NULL"
+        )
         args: list[Any] = [latest_fy, prev_fy]
         if sector:
-            cond += f" AND sector_normalized = ${len(args) + 1}"
+            cond += f" AND {_sector_match_sql(f'${len(args) + 1}')}"
             args.append(sector)
         if province:
-            cond += f" AND province = ${len(args) + 1}"
+            cond += f" AND a.province = ${len(args) + 1}"
             args.append(province)
-        rows = await self.pool.fetch(
-            f"SELECT a.program_id, p.name, "
-            f"SUM(amount) FILTER (WHERE fiscal_year = $1) latest, "
-            f"SUM(amount) FILTER (WHERE fiscal_year = $2) prev "
-            f"FROM grant_awards a JOIN grant_programs p ON p.id = a.program_id "
-            f"WHERE {cond} GROUP BY a.program_id, p.name", *args)
+
+        async def _fetch_trending() -> list[Any]:
+            return await self.pool.fetch(
+                f"SELECT a.program_id, p.name, "
+                f"SUM(a.amount) FILTER (WHERE a.fiscal_year = $1) latest, "
+                f"SUM(a.amount) FILTER (WHERE a.fiscal_year = $2) prev "
+                f"FROM grant_awards a JOIN grant_programs p ON p.id = a.program_id "
+                f"WHERE {cond} GROUP BY a.program_id, p.name", *args)
+
+        rows = await _fetch_trending()
+        if not rows and province:
+            cond_np = (
+                "a.is_latest_amendment AND a.amount IS NOT NULL AND a.program_id IS NOT NULL"
+            )
+            args_np: list[Any] = [latest_fy, prev_fy]
+            if sector:
+                cond_np += f" AND {_sector_match_sql(f'${len(args_np) + 1}')}"
+                args_np.append(sector)
+            rows = await self.pool.fetch(
+                f"SELECT a.program_id, p.name, "
+                f"SUM(a.amount) FILTER (WHERE a.fiscal_year = $1) latest, "
+                f"SUM(a.amount) FILTER (WHERE a.fiscal_year = $2) prev "
+                f"FROM grant_awards a JOIN grant_programs p ON p.id = a.program_id "
+                f"WHERE {cond_np} GROUP BY a.program_id, p.name", *args_np)
         out = []
         for r in rows:
             latest = float(r["latest"] or 0)
@@ -755,29 +866,46 @@ class PgRepository:
     async def get_similar_recipients(self, profile: dict, limit: int = 8) -> list[dict]:
         sector = profile.get("sector")
         province = profile.get("province")
-        cond = ["a.is_latest_amendment"]
-        args: list[Any] = []
-        if sector:
-            args.append(sector)
-            cond.append(f"a.sector_normalized = ${len(args)}")
-        if province:
-            args.append(province)
-            cond.append(f"r.province = ${len(args)}")
-        where = " AND ".join(cond)
-        rows = await self.pool.fetch(
-            f"SELECT r.id, r.name_normalized name, r.province, r.city, "
-            f"COUNT(a.id) award_count, COALESCE(SUM(a.amount),0) total_amount, "
-            f"(ARRAY_AGG(a.sector_normalized ORDER BY a.amount DESC NULLS LAST) "
-            f" FILTER (WHERE a.sector_normalized IS NOT NULL))[1] primary_sector, "
-            f"(ARRAY_AGG(a.naics_code ORDER BY a.amount DESC NULLS LAST) "
-            f" FILTER (WHERE a.naics_code IS NOT NULL))[1] primary_naics, "
-            f"ARRAY_AGG(DISTINCT a.program_id) FILTER (WHERE a.program_id IS NOT NULL) program_ids "
-            f"FROM recipients r JOIN grant_awards a ON a.recipient_id = r.id "
-            f"WHERE {where} "
-            f"GROUP BY r.id HAVING COALESCE(SUM(a.amount),0) > 0 "
-            f"ORDER BY total_amount DESC LIMIT 200",
-            *args,
-        )
+        recent_fys = await self._recent_fiscal_years(2)
+
+        async def _fetch_peers(with_province: bool) -> list[Any]:
+            peer_cond = [
+                "a.is_latest_amendment",
+                "a.amount IS NOT NULL",
+            ]
+            peer_args: list[Any] = []
+            if recent_fys:
+                peer_args.append(recent_fys)
+                peer_cond.append(f"a.fiscal_year = ANY(${len(peer_args)}::text[])")
+            if sector:
+                peer_args.append(sector)
+                peer_cond.append(f"a.sector_normalized = ${len(peer_args)}")
+            if with_province and province:
+                peer_args.append(province)
+                peer_cond.append(f"r.province = ${len(peer_args)}")
+            peer_where = " AND ".join(peer_cond)
+            return await self.pool.fetch(
+                f"SELECT r.id, r.name_normalized name, r.province, r.city, "
+                f"COUNT(a.id) award_count, COALESCE(SUM(a.amount),0) total_amount, "
+                f"(ARRAY_AGG(a.sector_normalized ORDER BY a.amount DESC NULLS LAST) "
+                f" FILTER (WHERE a.sector_normalized IS NOT NULL))[1] primary_sector, "
+                f"(ARRAY_AGG(a.naics_code ORDER BY a.amount DESC NULLS LAST) "
+                f" FILTER (WHERE a.naics_code IS NOT NULL))[1] primary_naics, "
+                f"ARRAY_AGG(DISTINCT a.program_id) FILTER (WHERE a.program_id IS NOT NULL) program_ids "
+                f"FROM recipients r JOIN grant_awards a ON a.recipient_id = r.id "
+                f"WHERE {peer_where} "
+                f"GROUP BY r.id HAVING COALESCE(SUM(a.amount),0) > 0 "
+                f"ORDER BY total_amount DESC LIMIT 200",
+                *peer_args,
+            )
+
+        try:
+            rows = await _fetch_peers(with_province=True)
+            if not rows and province:
+                rows = await _fetch_peers(with_province=False)
+        except Exception as exc:
+            log.warning("get_similar_recipients skipped: %s", exc)
+            rows = []
         summaries: dict[str, dict] = {}
         for r in rows:
             summaries[str(r["id"])] = {

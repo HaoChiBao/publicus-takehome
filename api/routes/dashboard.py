@@ -57,9 +57,26 @@ async def dashboard(session_id: str):
     if profile is None:
         raise HTTPException(status_code=404, detail="Profile not found")
 
+    sector = profile.get("sector")
+    province = profile.get("province")
     matches = await repo.match_programs(profile, limit=10)
-    summary = await repo.sector_summary(profile["sector"], profile.get("province"), years=2)
-    trending = await repo.trending_programs(profile["sector"], profile.get("province"))
+    summary = (
+        await repo.sector_summary(sector, province, years=2)
+        if sector
+        else {
+            "sector": sector,
+            "province": province,
+            "total_amount": 0,
+            "award_count": 0,
+            "avg_amount": 0,
+            "top_programs": [],
+            "by_fiscal_year": [],
+            "top_recipients": [],
+        }
+    )
+    trending = (
+        await repo.trending_programs(sector, province) if sector else []
+    )
     alerts = await repo.get_alerts(profile, days=90)
     peers = await repo.get_similar_recipients(profile, limit=8)
 

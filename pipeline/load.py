@@ -22,8 +22,9 @@ from typing import Any, Optional
 import pandas as pd
 
 from utils import (
-    PROCESSED_DIR, VALID_PROVINCE_CODES, get_logger, iter_csv_chunks,
-    log_pipeline_run, normalize_province, read_csv_file,
+    PROCESSED_DIR, VALID_PROVINCE_CODES, count_csv_rows, finish_progress,
+    get_logger, iter_csv_chunks, log_pipeline_run, normalize_province,
+    phase_banner, read_csv_file, show_progress,
 )
 from enrich import _normalize_bbf_columns
 
@@ -132,6 +133,7 @@ class LoadContext:
         program_id_by_norm: dict[str, str],
         program_id_by_loose: dict[str, str],
         sector_map: dict[str, str],
+        raw_to_canonical: dict[str, str],
     ):
         self.recipients = recipients
         self.programs = programs
@@ -139,7 +141,34 @@ class LoadContext:
         self.program_id_by_norm = program_id_by_norm
         self.program_id_by_loose = program_id_by_loose
         self.sector_map = sector_map
+        self.raw_to_canonical = raw_to_canonical
         self.award_count = 0
+
+
+def _raw_to_canonical_map(recipients: list[dict]) -> dict[str, str]:
+    """Map raw recipient spellings -> canonical name from recipients.csv clusters."""
+    out: dict[str, str] = {}
+    for r in recipients:
+        canon = r.get("name_normalized")
+        if not canon:
+            continue
+        out[str(canon).strip()] = canon
+        for raw in r.get("names_raw") or []:
+            s = str(raw).strip()
+            if s:
+                out[s] = canon
+    return out
+
+
+def _resolve_recipient_canonical(a: Any, ctx: LoadContext) -> Optional[str]:
+    """Prefer recipient_canonical column; fall back to recipients.csv mapping."""
+    canonical = _str(a.get("recipient_canonical"))
+    if canonical:
+        return canonical
+    raw = _str(a.get("recipient_name_raw"))
+    if not raw:
+        return None
+    return ctx.raw_to_canonical.get(raw) or raw
 
 
 def _snapshot_ids(filename: str, key: str) -> dict[str, str]:
@@ -274,11 +303,12 @@ def build_context() -> LoadContext:
     return LoadContext(
         recipients, programs, recipient_id_by_name,
         program_id_by_norm, program_id_by_loose, sector_map,
+        _raw_to_canonical_map(recipients),
     )
 
 
 def _award_row(a: Any, ctx: LoadContext) -> tuple:
-    canonical = _str(a.get("recipient_canonical"))
+    canonical = _resolve_recipient_canonical(a, ctx)
     prog_raw = _str(a.get("program_name_raw"))
     norm = (prog_raw or "").lower().strip()
     sector = ctx.sector_map.get(prog_raw or "", "OTHER")
@@ -338,17 +368,30 @@ def write_snapshot(ctx: LoadContext) -> None:
 
 
 async def _executemany_batched(conn, sql: str, rows: list[tuple], label: str) -> None:
-    for i in range(0, len(rows), INSERT_BATCH):
+    total = len(rows)
+    if not total:
+        return
+    log.info("Uploading %s %s…", total, label)
+    for i in range(0, total, INSERT_BATCH):
         batch = rows[i:i + INSERT_BATCH]
         await conn.executemany(sql, batch)
-        log.info("Inserted %s %s (%s / %s)", len(batch), label, i + len(batch), len(rows))
+        show_progress(label, min(i + len(batch), total), total)
+    finish_progress()
+    log.info("Uploaded %s %s", total, label)
+
+
+async def _connect_writable(dsn: str):
+    """Supabase pooler connections default to read-only — force read-write."""
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn)
+    await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+    return conn
 
 
 async def write_to_db(ctx: LoadContext) -> None:
-    import asyncpg
-
     dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    conn = await _connect_writable(dsn)
     awards_path = PROCESSED_DIR / "awards_clean.csv"
     insert_awards_sql = """
         INSERT INTO grant_awards
@@ -399,8 +442,13 @@ async def write_to_db(ctx: LoadContext) -> None:
                 "grant_programs",
             )
 
-            for p in ctx.programs:
+            prog_total = len(ctx.programs)
+            log.info("Refreshing search vectors for %s programs…", prog_total)
+            for i, p in enumerate(ctx.programs, 1):
                 await conn.execute("SELECT refresh_program_search_vector($1)", p["id"])
+                if i % 50 == 0 or i == prog_total:
+                    show_progress("search vectors", i, prog_total)
+            finish_progress()
 
             await _load_knowledge_tables(conn)
 
@@ -414,6 +462,8 @@ async def write_to_db(ctx: LoadContext) -> None:
             )
 
         if awards_only or not skip_awards:
+            total_awards = count_csv_rows(awards_path) if awards_path.exists() else 0
+            log.info("Uploading %s grant_awards…", total_awards)
             batch: list[tuple] = []
             for chunk in iter_csv_chunks(awards_path, chunksize=100_000):
                 for _, a in chunk.iterrows():
@@ -421,12 +471,14 @@ async def write_to_db(ctx: LoadContext) -> None:
                     if len(batch) >= AWARD_BATCH:
                         await conn.executemany(insert_awards_sql, batch)
                         ctx.award_count += len(batch)
-                        log.info("Inserted %s grant_awards so far", ctx.award_count)
+                        show_progress("grant_awards", ctx.award_count, total_awards)
                         batch.clear()
             if batch:
                 await conn.executemany(insert_awards_sql, batch)
                 ctx.award_count += len(batch)
-                log.info("Inserted %s grant_awards total", ctx.award_count)
+                show_progress("grant_awards", ctx.award_count, total_awards)
+            finish_progress()
+            log.info("Uploaded %s grant_awards total", ctx.award_count)
         elif skip_awards:
             log.info("SKIP_AWARDS=1 — skipping grant_awards upload")
 
@@ -512,14 +564,17 @@ async def _load_knowledge_tables(conn) -> None:
     embeddings = await _load_json("grant_embeddings.json")
     if embeddings:
         import uuid as _uuid
-        await conn.executemany(
-            """INSERT INTO grant_embeddings
-               (id, entity_type, entity_id, model, embedding, content_text, metadata)
-               VALUES ($1,$2,$3,$4,$5::vector,$6,$7::jsonb)""",
-            [(str(_uuid.uuid4()), e["entity_type"], e["entity_id"], e["model"],
-              str(e["embedding"]), e.get("content_text"), "{}") for e in embeddings],
-        )
-        log.info("Inserted %s grant_embeddings", len(embeddings))
+        embed_sql = """
+            INSERT INTO grant_embeddings
+            (id, entity_type, entity_id, model, embedding, content_text, metadata)
+            VALUES ($1,$2,$3,$4,$5::vector,$6,$7::jsonb)
+        """
+        embed_rows = [
+            (str(_uuid.uuid4()), e["entity_type"], e["entity_id"], e["model"],
+             str(e["embedding"]), e.get("content_text"), "{}")
+            for e in embeddings
+        ]
+        await _executemany_batched(conn, embed_sql, embed_rows, "grant_embeddings")
 
     insights = await _load_json("grant_insights.json")
     if insights:
@@ -591,14 +646,22 @@ async def _migrate_session_data(conn) -> None:
 async def run() -> None:
     ctx = build_context()
     awards_only = os.getenv("LOAD_AWARDS_ONLY") == "1"
+    upload_only = os.getenv("LOAD_UPLOAD_ONLY") == "1"
 
     if awards_only:
+        phase_banner(1, 1, "Upload grant_awards to Supabase")
         log.info("LOAD_AWARDS_ONLY=1 — skipping stats/knowledge/index; uploading awards only")
+    elif upload_only:
+        phase_banner(1, 1, "Upload cached checkpoints to Supabase")
+        log.info(
+            "LOAD_UPLOAD_ONLY=1 — using existing grant_*.json + CSV files (no recompute)"
+        )
     else:
         import knowledge
         import index_search
         import stats as stats_mod
 
+        phase_banner(1, 4, "Compute program stats from awards")
         program_stats = stats_mod.compute_program_stats(ctx)
         stats_mod.save_stats(program_stats)
 
@@ -608,14 +671,27 @@ async def run() -> None:
             if s:
                 p["eligible_naics_prefixes"] = s.get("naics_top_prefixes") or []
 
+        phase_banner(2, 4, "Build knowledge metadata + insights")
         await knowledge.run(ctx)
+
+        phase_banner(3, 4, "Build search chunks + embeddings")
         await index_search.run(ctx)
+
+        phase_banner(4, 4, "Write local snapshots")
         write_snapshot(ctx)
 
     if os.getenv("DATABASE_URL"):
+        if not awards_only and not upload_only:
+            phase_banner(5, 5, "Upload everything to Supabase")
         try:
             await write_to_db(ctx)
+            finish_progress()
+            log.info(
+                "Supabase upload complete — %s programs, %s recipients, %s awards",
+                len(ctx.programs), len(ctx.recipients), ctx.award_count,
+            )
         except Exception as e:  # noqa: BLE001
+            finish_progress()
             log.error("DB load failed (%s). Local snapshots for recipients/programs remain.", e)
             raise
     else:

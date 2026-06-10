@@ -54,6 +54,58 @@ def get_logger(name: str) -> logging.Logger:
 log = get_logger("pipeline.utils")
 
 
+# ---------------------------------------------------------------------------
+# Terminal progress (stderr — safe alongside logging on stdout)
+# ---------------------------------------------------------------------------
+def count_csv_rows(path: Path) -> int:
+    """Row count excluding the header."""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return max(sum(1 for _ in f) - 1, 0)
+
+
+def _format_count(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def progress_bar(label: str, current: int, total: int, width: int = 40) -> str:
+    if total > 0:
+        pct = min(current / total, 1.0)
+        filled = int(width * pct)
+        bar = "=" * filled + (">" if filled < width else "") + " " * max(
+            width - filled - (1 if filled < width else 0), 0
+        )
+        return (
+            f"  {label}: [{bar}] {pct * 100:5.1f}% "
+            f"({_format_count(current)} / {_format_count(total)})"
+        )
+    return f"  {label}: {_format_count(current)} rows..."
+
+
+def show_progress(label: str, current: int, total: int) -> None:
+    import sys
+
+    sys.stderr.write("\r" + progress_bar(label, current, total))
+    sys.stderr.flush()
+
+
+def finish_progress() -> None:
+    import sys
+
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def phase_banner(phase: int, total_phases: int, title: str) -> None:
+    import sys
+
+    sys.stderr.write(f"\n{'=' * 60}\n  [{phase}/{total_phases}] {title}\n{'=' * 60}\n")
+    sys.stderr.flush()
+
+
 def timestamp() -> str:
     """Filesystem-friendly timestamp, e.g. 20240605_171930."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -548,7 +548,7 @@ def similar_recipients(
     scored = []
     for rid, peer in summaries.items():
         sim, reasons = score_peer(profile, peer)
-        if sim < 0.25:
+        if sim < 0.15:
             continue
         prog_names = []
         for pid in peer.get("program_ids", [])[:5]:

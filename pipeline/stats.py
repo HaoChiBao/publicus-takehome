@@ -10,7 +10,10 @@ from typing import Any, Optional
 import pandas as pd
 
 from load import LoadContext, _loose_key
-from utils import PROCESSED_DIR, get_logger, iter_csv_chunks
+from utils import (
+    PROCESSED_DIR, count_csv_rows, finish_progress, get_logger,
+    iter_csv_chunks, show_progress,
+)
 
 log = get_logger("pipeline.stats")
 STATS_PATH = PROCESSED_DIR / "grant_program_stats.json"
@@ -32,13 +35,25 @@ def compute_program_stats(ctx: LoadContext) -> list[dict]:
     for p in ctx.programs:
         name_to_id[_loose_key(p["name"])] = p["id"]
 
+    header_cols = set(pd.read_csv(awards_path, nrows=0).columns)
     usecols = [
-        "program_name_raw", "amount", "province", "naics_code", "fiscal_year",
-        "end_date", "recipient_canonical", "is_latest_amendment",
+        c for c in (
+            "program_name_raw", "amount", "province", "naics_code", "fiscal_year",
+            "end_date", "is_latest_amendment",
+            "recipient_canonical" if "recipient_canonical" in header_cols else "recipient_name_raw",
+            *(["sector_normalized"] if "sector_normalized" in header_cols else []),
+        )
+        if c in header_cols
     ]
+    total_rows = count_csv_rows(awards_path)
+    log.info("Scanning %s award rows for program stats…", total_rows)
+    rows_done = 0
     agg: dict[str, dict[str, Any]] = {}
     for chunk in iter_csv_chunks(awards_path, chunksize=100_000, usecols=usecols):
         for _, a in chunk.iterrows():
+            rows_done += 1
+            if rows_done % 50_000 == 0 or rows_done == total_rows:
+                show_progress("stats scan", rows_done, total_rows)
             if not a.get("is_latest_amendment"):
                 continue
             key = _loose_key(str(a.get("program_name_raw") or ""))
@@ -80,6 +95,8 @@ def compute_program_stats(ctx: LoadContext) -> list[dict]:
             if naics and str(naics) not in ("nan", "None", ""):
                 g["naics"].add(str(naics)[:4])
             rec = a.get("recipient_canonical")
+            if rec is None or (isinstance(rec, float) and pd.isna(rec)) or str(rec) in ("nan", "None", ""):
+                rec = a.get("recipient_name_raw")
             if rec and str(rec) not in ("nan", "None", ""):
                 g["recipients"].add(str(rec))
             end = a.get("end_date")
@@ -129,6 +146,7 @@ def compute_program_stats(ctx: LoadContext) -> list[dict]:
             "top_recipient_names": [],
         })
 
+    finish_progress()
     log.info("Computed stats for %s programs with award history", len(out))
     return out
 
