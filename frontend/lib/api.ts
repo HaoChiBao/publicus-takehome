@@ -1,6 +1,6 @@
 // Tiny typed fetch wrapper around the FastAPI backend.
-export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Default "" uses Next.js rewrites (same-origin /api/* → backend) in local dev.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, { cache: "no-store" });
@@ -33,6 +33,43 @@ export interface MatchInfo {
   activities?: boolean;
   hasHistory: boolean;
 }
+export interface ProgramStats {
+  grant_program_id?: string;
+  total_disbursed?: number;
+  award_count?: number;
+  recipient_count?: number;
+  avg_award?: number;
+  median_award?: number;
+  p90_award?: number;
+  largest_award?: number;
+  provinces_active?: string[];
+  sectors_active?: string[];
+  naics_top_prefixes?: string[];
+  yoy_growth_pct?: number;
+  last_award_date?: string | null;
+  award_by_fiscal_year?: { year: string; total: number }[];
+  top_recipient_names?: string[];
+}
+export interface ProgramInsight {
+  grant_program_id?: string;
+  insight_type?: string;
+  content: string;
+  evidence?: Record<string, unknown>;
+  model?: string;
+}
+export interface GrantCitation {
+  program_id: string;
+  name: string;
+  stats?: ProgramStats | null;
+  apply_url?: string | null;
+}
+export interface GrantAskResult {
+  answer: string;
+  programs: Program[];
+  citations: GrantCitation[];
+  insights: string[];
+  total: number;
+}
 export interface Program {
   id: string;
   source?: string;
@@ -40,6 +77,14 @@ export interface Program {
   department?: string;
   program_type?: string;
   description?: string;
+  short_description?: string;
+  long_description?: string;
+  summary_1liner?: string;
+  eligibility_narrative?: string;
+  target_audience?: string;
+  application_steps?: string[];
+  stacking_notes?: string;
+  keywords?: string[];
   min_amount?: number | null;
   max_amount?: number | null;
   eligible_provinces?: string[];
@@ -50,12 +95,14 @@ export interface Program {
   deadline?: string | null;
   is_open?: boolean;
   apply_url?: string | null;
+  source_url?: string | null;
   last_updated?: string | null;
   sred_related?: boolean;
   tax_credit_type?: string | null;
   score?: number;
   match?: MatchInfo;
   match_reasons?: string[];
+  stats?: ProgramStats;
 }
 export interface Award {
   id: string;
@@ -213,10 +260,19 @@ export const api = {
     );
   },
 
+  askGrants: (question: string, sessionId?: string) =>
+    post<GrantAskResult>("/api/grants/ask", {
+      question,
+      session_id: sessionId,
+    }),
+
   programAwards: (id: string, limit = 25, offset = 0) =>
-    get<{ program: Program; awards: Award[]; total: number }>(
+    get<{ program: Program; awards: Award[]; total: number; insights?: ProgramInsight[] }>(
       `/api/awards/program/${id}?limit=${limit}&offset=${offset}`
     ),
+
+  programInsights: (id: string) =>
+    get<{ insights: ProgramInsight[] }>(`/api/programs/${id}/insights`),
 
   programReadiness: (programId: string, sessionId: string) =>
     get<ReadinessResult>(

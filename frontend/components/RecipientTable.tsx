@@ -28,10 +28,12 @@ type SortKey = "amount" | "fiscal_year";
 export default function RecipientTable({
   awards,
   showRecipient = false,
+  linkRecipients = false,
   pageSize = 25,
 }: {
   awards: Award[];
   showRecipient?: boolean;
+  linkRecipients?: boolean;
   pageSize?: number;
 }) {
   const [sortKey, setSortKey] = useState<SortKey>("amount");
@@ -48,7 +50,7 @@ export default function RecipientTable({
 
   const pages = Math.max(1, Math.ceil(sorted.length / pageSize));
   const rows = sorted.slice(page * pageSize, page * pageSize + pageSize);
-  const colCount = (showRecipient ? 7 : 6) + 1;
+  const colCount = (showRecipient ? 8 : 7) + 1;
 
   function toggleSort(key: SortKey) {
     if (key === sortKey) setAsc(!asc);
@@ -87,6 +89,7 @@ export default function RecipientTable({
               </button>
             </TableHead>
             <TableHead>Province</TableHead>
+            <TableHead>Sector</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -111,7 +114,17 @@ export default function RecipientTable({
                   </TableCell>
                   {showRecipient && (
                     <TableCell className="font-medium">
-                      {a.recipient_name || a.recipient_name_raw}
+                      {linkRecipients && a.recipient_id ? (
+                        <Link
+                          href={`/recipients/${a.recipient_id}`}
+                          className="hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {a.recipient_name || a.recipient_name_raw}
+                        </Link>
+                      ) : (
+                        a.recipient_name || a.recipient_name_raw
+                      )}
                     </TableCell>
                   )}
                   <TableCell className="max-w-[220px] truncate text-muted-foreground">
@@ -127,6 +140,11 @@ export default function RecipientTable({
                     {a.fiscal_year || "—"}
                   </TableCell>
                   <TableCell>{a.province || "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {a.sector_normalized
+                      ? sectorLabel(a.sector_normalized)
+                      : "—"}
+                  </TableCell>
                 </TableRow>
                 {open && (
                   <TableRow className="hover:bg-transparent">

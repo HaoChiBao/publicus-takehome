@@ -217,7 +217,7 @@ class JsonRepository:
     async def program_detail(self, program_id: str, limit: int, offset: int) -> dict:
         program = next((p for p in self.programs if p["id"] == program_id), None)
         if program is None:
-            return {"program": None, "awards": [], "total": 0}
+            return {"program": None, "awards": [], "total": 0, "insights": []}
         awards = [a for a in self._latest_awards() if a.get("program_id") == program_id]
         awards.sort(key=lambda a: a.get("amount") or 0, reverse=True)
         total = len(awards)
@@ -225,7 +225,11 @@ class JsonRepository:
         name_by_id = {r["id"]: r["name_normalized"] for r in self.recipients}
         page = [{**a, "recipient_name": name_by_id.get(a.get("recipient_id"),
                                                        a.get("recipient_name_raw"))} for a in page]
-        return {"program": program, "awards": page, "total": total}
+        insights = self.insights_by_program.get(program_id, [])
+        return {"program": program, "awards": page, "total": total, "insights": insights}
+
+    async def program_insights(self, program_id: str) -> list[dict]:
+        return self.insights_by_program.get(program_id, [])
 
     async def search_recipients(self, q: str, province: Optional[str], limit: int = 10) -> list[dict]:
         ql = (q or "").lower().strip()
@@ -552,7 +556,15 @@ class PgRepository:
     async def program_detail(self, program_id: str, limit: int, offset: int) -> dict:
         prow = await self.pool.fetchrow("SELECT * FROM grant_programs WHERE id = $1", program_id)
         if prow is None:
-            return {"program": None, "awards": [], "total": 0}
+            return {"program": None, "awards": [], "total": 0, "insights": []}
+        program = self._row(prow)
+        stats_row = await self.pool.fetchrow(
+            "SELECT * FROM grant_program_stats WHERE grant_program_id = $1", program_id)
+        if stats_row:
+            program["stats"] = self._row(stats_row)
+        insight_rows = await self.pool.fetch(
+            "SELECT * FROM grant_insights WHERE grant_program_id = $1", program_id)
+        insights = [self._row(r) for r in insight_rows]
         total = await self.pool.fetchval(
             "SELECT COUNT(*) FROM grant_awards WHERE program_id = $1 AND is_latest_amendment",
             program_id)
@@ -561,7 +573,17 @@ class PgRepository:
             "FROM grant_awards a LEFT JOIN recipients r ON r.id = a.recipient_id "
             "WHERE a.program_id = $1 AND a.is_latest_amendment "
             "ORDER BY a.amount DESC NULLS LAST LIMIT $2 OFFSET $3", program_id, limit, offset)
-        return {"program": self._row(prow), "awards": [self._row(r) for r in rows], "total": total}
+        return {
+            "program": program,
+            "awards": [self._row(r) for r in rows],
+            "total": total,
+            "insights": insights,
+        }
+
+    async def program_insights(self, program_id: str) -> list[dict]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM grant_insights WHERE grant_program_id = $1", program_id)
+        return [self._row(r) for r in rows]
 
     async def search_recipients(self, q: str, province: Optional[str], limit: int = 10) -> list[dict]:
         cond = "to_tsvector('english', r.name_normalized) @@ plainto_tsquery('english', $1)"

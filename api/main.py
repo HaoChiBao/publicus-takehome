@@ -50,12 +50,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow the Next.js frontend (configurable for the deployed origin).
-origins = os.getenv("CORS_ORIGINS", "*").split(",")
+# CORS — explicit origins required when allow_credentials=True (* is invalid).
+_default_origins = "http://localhost:3000,http://127.0.0.1:3000"
+_origins_env = os.getenv("CORS_ORIGINS", _default_origins)
+origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
+allow_credentials = "*" not in origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins if origins else _default_origins.split(","),
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

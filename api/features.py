@@ -251,6 +251,9 @@ def _sort_key(program: dict, sort: str):
     if sort == "amount":
         amt = program.get("max_amount")
         return (-float(amt) if amt is not None else float("inf"),)
+    if sort == "disbursement":
+        stats = program.get("stats") or {}
+        return (-float(stats.get("total_disbursed") or 0),)
     if sort == "deadline":
         dl = program.get("deadline")
         return (dl is None, dl or "")
@@ -304,7 +307,7 @@ def browse_programs(
             row["score"] = 0
         scored.append(row)
 
-    reverse = sort in ("score", "amount")
+    reverse = sort in ("score", "amount", "disbursement")
     scored.sort(key=lambda p: _sort_key(p, sort), reverse=reverse)
     total = len(scored)
     return scored[offset : offset + limit], total

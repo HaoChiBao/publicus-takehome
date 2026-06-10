@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { ArrowUpRight, Download, Pencil, TrendingUp, X } from "lucide-react";
+import { Download, Pencil, TrendingUp, X } from "lucide-react";
 import {
   api,
   type DeadlineAlert,
@@ -12,14 +12,14 @@ import {
   type SectorSummary,
   type TrendingProgram,
 } from "@/lib/api";
-import { amountRange, formatCurrencyFull } from "@/lib/format";
+import { formatCurrencyFull } from "@/lib/format";
 import { sectorLabel } from "@/lib/constants";
 import AlertsBanner from "@/components/AlertsBanner";
 import CompanyProfileForm, {
   profileToFormValues,
   type ProfileFormValues,
 } from "@/components/CompanyProfileForm";
-import MatchScore from "@/components/MatchScore";
+import ProgramCard from "@/components/ProgramCard";
 import PeerMatchCard from "@/components/PeerMatchCard";
 import SectorIntelCard from "@/components/SectorIntelCard";
 import { Badge } from "@/components/ui/badge";
@@ -217,7 +217,7 @@ export default function DashboardPage() {
               </p>
             )}
             {data.matches.map((p) => (
-              <MatchCard key={p.id} program={p} />
+              <ProgramCard key={p.id} program={p} compact />
             ))}
           </div>
         </section>
@@ -281,58 +281,3 @@ export default function DashboardPage() {
   );
 }
 
-function MatchCard({ program: p }: { program: Program }) {
-  return (
-    <Link href={`/program/${p.id}`} className="block">
-      <Card className="transition-colors hover:border-foreground">
-        <CardContent className="space-y-3 p-4">
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <h3 className="font-semibold leading-tight">{p.name}</h3>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {p.department}
-              </p>
-            </div>
-            <Badge className="shrink-0 tabular-nums">
-              {Math.round((p.score || 0) * 100)}%
-            </Badge>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-1.5 text-sm">
-            <Badge variant="secondary">{amountRange(p.min_amount, p.max_amount)}</Badge>
-            {p.program_type && (
-              <Badge variant="outline">{p.program_type}</Badge>
-            )}
-            {p.deadline && (
-              <Badge variant="outline" className="tabular-nums">
-                Due {p.deadline}
-              </Badge>
-            )}
-          </div>
-
-          {p.match && (
-            <MatchScore
-              province={p.match.province}
-              sector={p.match.sector}
-              size={p.match.size}
-              naics={p.match.naics}
-              activities={p.match.activities}
-              hasHistory={p.match.hasHistory}
-            />
-          )}
-
-          {p.match_reasons && p.match_reasons.length > 0 && (
-            <ul className="space-y-0.5 border-t pt-2 text-xs text-muted-foreground">
-              {p.match_reasons.map((r) => (
-                <li key={r} className="flex items-start gap-1.5">
-                  <ArrowUpRight className="mt-0.5 size-3 shrink-0" />
-                  {r}
-                </li>
-              ))}
-            </ul>
-          )}
-        </CardContent>
-      </Card>
-    </Link>
-  );
-}
