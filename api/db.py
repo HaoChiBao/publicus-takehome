@@ -400,6 +400,19 @@ class PgRepository:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
         return self
 
+    async def _fetchrow_write(self, query: str, *args: Any):
+        """Run a write query on Supabase pooler connections (default read-only tx)."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION READ WRITE")
+                return await conn.fetchrow(query, *args)
+
+    async def _execute_write(self, query: str, *args: Any):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION READ WRITE")
+                return await conn.execute(query, *args)
+
     async def _ensure_caches(self):
         count = int(await self.pool.fetchval("SELECT COUNT(*) FROM grant_programs") or 0)
         if self._programs_cache and len(self._programs_cache) == count:
@@ -670,7 +683,7 @@ class PgRepository:
         return self._row(row) if row else None
 
     async def create_profile(self, profile: dict) -> dict:
-        row = await self.pool.fetchrow(
+        row = await self._fetchrow_write(
             "INSERT INTO company_profiles "
             "(session_id, name, sector, province, size_band, activities, naics_code) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id) DO UPDATE SET "
@@ -793,7 +806,7 @@ class PgRepository:
         return {"programs": programs, "recipients": recipients}
 
     async def add_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
-        await self.pool.execute(
+        await self._execute_write(
             "INSERT INTO watchlist_items (session_id, entity_type, entity_id) "
             "VALUES ($1, $2, $3) ON CONFLICT (session_id, entity_type, entity_id) DO NOTHING",
             session_id, entity_type, entity_id,
@@ -801,7 +814,7 @@ class PgRepository:
         return {"ok": True}
 
     async def remove_watchlist_item(self, session_id: str, entity_type: str, entity_id: str) -> dict:
-        await self.pool.execute(
+        await self._execute_write(
             "DELETE FROM watchlist_items WHERE session_id = $1 AND entity_type = $2 AND entity_id = $3",
             session_id, entity_type, entity_id,
         )
