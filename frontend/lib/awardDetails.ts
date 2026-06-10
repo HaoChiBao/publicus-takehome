@@ -16,6 +16,15 @@ const SOURCE_LABELS: Record<string, string> = {
   nrc_irap: "NRC IRAP",
 };
 
+/** Proactive Disclosure — Grants and Contributions (Treasury Board consolidated dataset). */
+const OPEN_CANADA_GRANTS_DATASET =
+  "https://open.canada.ca/data/en/dataset/432527ab-7aac-45b5-81d6-7597107a7013";
+
+/** Official grants search portal (replaces deprecated search.open.canada.ca/opendata). */
+function openCanadaGrantsSearchUrl(query: string): string {
+  return `https://search.open.canada.ca/grants/?search_text=${encodeURIComponent(query)}`;
+}
+
 function clean(value?: string | null): string | undefined {
   const s = (value ?? "").trim();
   return s || undefined;
@@ -90,12 +99,12 @@ export function awardLinks(award: Award): AwardLink[] {
   if (award.source === "open_canada" && ref) {
     links.push({
       label: "Look up on Open Government",
-      href: `https://search.open.canada.ca/opendata/?q=${encodeURIComponent(ref)}`,
+      href: openCanadaGrantsSearchUrl(ref),
       external: true,
     });
     links.push({
       label: "Grants & contributions dataset",
-      href: "https://open.canada.ca/data/en/dataset/92913447-f6d6-43b0-a4fe-b2af7e4edb61",
+      href: OPEN_CANADA_GRANTS_DATASET,
       external: true,
     });
   }

@@ -197,6 +197,40 @@ export interface OverlapFlag {
   message: string;
   related_programs?: { id: string; name: string; program_type?: string }[];
 }
+export interface ApplyGuideMessage {
+  role: "assistant" | "user";
+  content: string;
+}
+export interface ApplyGuideDocument {
+  name: string;
+  detail: string;
+  required: boolean;
+}
+export interface ApplyGuideStep {
+  order: number;
+  title: string;
+  detail: string;
+}
+export interface ApplyGuideLink {
+  label: string;
+  href: string;
+  external?: boolean;
+}
+export interface ApplyGuideResult {
+  messages: ApplyGuideMessage[];
+  steps: ApplyGuideStep[];
+  documents: ApplyGuideDocument[];
+  blockers: string[];
+  warnings: string[];
+  links: ApplyGuideLink[];
+  readiness_score: number;
+  model: string;
+}
+export interface ApplyChatResult {
+  answer: string;
+  model: string;
+  link?: ApplyGuideLink;
+}
 
 // ---- Endpoints ----
 export const api = {
@@ -287,6 +321,25 @@ export const api = {
   programOverlap: (programId: string, sessionId: string) =>
     get<{ flags: OverlapFlag[] }>(
       `/api/programs/${programId}/overlap?session_id=${sessionId}`
+    ),
+
+  programApplyGuide: (programId: string, sessionId?: string) => {
+    const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    return post<ApplyGuideResult>(
+      `/api/programs/${encodeURIComponent(programId)}/apply-guide${qs}`,
+      {}
+    );
+  },
+
+  programApplyChat: (
+    programId: string,
+    question: string,
+    sessionId?: string,
+    history: ApplyGuideMessage[] = []
+  ) =>
+    post<ApplyChatResult>(
+      `/api/programs/${encodeURIComponent(programId)}/apply-chat`,
+      { question, session_id: sessionId, history }
     ),
 
   naicsLookup: (q: string) =>

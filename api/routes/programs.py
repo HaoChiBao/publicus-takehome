@@ -4,11 +4,18 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from db import get_repo
 from features import lookup_naics
 
 router = APIRouter(prefix="/api/programs", tags=["programs"])
+
+
+class ApplyChatIn(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    history: list[dict] = []
 
 
 @router.get("")
@@ -94,6 +101,34 @@ async def get_program(program_id: str):
         "program": detail["program"],
         "insights": detail.get("insights") or [],
     }
+
+
+@router.post("/{program_id}/apply-guide")
+async def program_apply_guide(program_id: str, session_id: Optional[str] = None):
+    """AI-assisted how-to-apply guide: steps, documents, blockers, and chat seed."""
+    repo = await get_repo()
+    profile = await repo.get_profile(session_id) if session_id else None
+    guide = await repo.program_apply_guide(program_id, profile)
+    if guide is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    return guide
+
+
+@router.post("/{program_id}/apply-chat")
+async def program_apply_chat(program_id: str, body: ApplyChatIn):
+    """Follow-up Q&A in the apply-guide chat for a specific program."""
+    if not (body.question or "").strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    repo = await get_repo()
+    profile = None
+    if body.session_id:
+        profile = await repo.get_profile(body.session_id)
+    result = await repo.program_apply_chat(
+        program_id, profile, body.question.strip(), body.history or []
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Program not found")
+    return result
 
 
 @router.get("/{program_id}/insights")

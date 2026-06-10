@@ -1,6 +1,7 @@
 """Shared business logic for grants intelligence features."""
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime
 from typing import Any, Optional
@@ -636,6 +637,344 @@ def answer_grant_question(
         "citations": citations,
         "insights": insight_snippets,
         "total": total,
+    }
+
+
+def _default_apply_documents(program: dict, profile: Optional[dict]) -> list[dict]:
+    """Typical documents for Canadian grant applications."""
+    docs = [
+        {"name": "Business registration", "detail": "Certificate of incorporation or registration", "required": True},
+        {"name": "Financial statements", "detail": "Recent balance sheet and income statement (or accountant-prepared)", "required": True},
+        {"name": "Project plan", "detail": "Scope, timeline, budget, and expected outcomes", "required": True},
+    ]
+    acts = set((profile or {}).get("activities") or []) | set(program.get("eligible_activities") or [])
+    if "R&D" in acts or program.get("sred_related"):
+        docs.append({
+            "name": "R&D technical narrative",
+            "detail": "Describe eligible R&D activities; coordinate with SR&ED advisor if applicable",
+            "required": True,
+        })
+    if "Hiring" in acts:
+        docs.append({
+            "name": "Hiring plan",
+            "detail": "Roles, wages, start dates, and training commitments",
+            "required": True,
+        })
+    if "Export" in acts:
+        docs.append({
+            "name": "Export market plan",
+            "detail": "Target markets, sales projections, and market-entry strategy",
+            "required": False,
+        })
+    if (profile or {}).get("naics_code"):
+        docs.append({
+            "name": "NAICS verification",
+            "detail": f"Confirm primary NAICS {profile['naics_code']} matches program sector rules",
+            "required": False,
+        })
+    return docs
+
+
+def _default_apply_steps(program: dict) -> list[dict]:
+    raw = program.get("application_steps") or []
+    if raw:
+        return [
+            {"order": i + 1, "title": f"Step {i + 1}", "detail": str(step)}
+            for i, step in enumerate(raw)
+        ]
+    steps = [
+        {"order": 1, "title": "Confirm eligibility", "detail": "Review province, sector, size, and activity requirements against your profile."},
+        {"order": 2, "title": "Read official guidelines", "detail": "Open the program's application portal and download the latest intake guide."},
+        {"order": 3, "title": "Prepare documents", "detail": "Gather financials, incorporation records, and your project plan."},
+    ]
+    if program.get("apply_url"):
+        steps.append({
+            "order": 4,
+            "title": "Submit application",
+            "detail": "Complete the online form on the official program portal before the deadline.",
+        })
+    else:
+        steps.append({
+            "order": 4,
+            "title": "Contact program administrator",
+            "detail": "No online apply link is on file — contact the department listed for intake instructions.",
+        })
+    return steps
+
+
+def build_apply_guide(
+    program: dict,
+    profile: Optional[dict],
+    readiness: Optional[dict],
+    overlaps: list[dict],
+    insights: Optional[list[dict]] = None,
+) -> dict:
+    """Structured how-to-apply guide with blockers, documents, and chat seed messages."""
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if readiness:
+        blockers.extend(readiness.get("blockers") or [])
+    else:
+        warnings.append("Sign in with a company profile to check personalized eligibility blockers.")
+
+    if program.get("is_open") is False:
+        blockers.append("Program is marked as closed — confirm whether a new intake window is open.")
+
+    if not program.get("apply_url"):
+        blockers.append("No official application URL on file — verify how to apply on the department website.")
+
+    for flag in overlaps:
+        msg = flag.get("message", "")
+        if flag.get("severity") == "warning":
+            warnings.append(msg)
+        elif msg:
+            warnings.append(msg)
+
+    steps = _default_apply_steps(program)
+    documents = _default_apply_documents(program, profile)
+    readiness_score = (readiness or {}).get("readiness_score", 0)
+
+    links: list[dict] = []
+    if program.get("apply_url"):
+        links.append({"label": "Official application portal", "href": program["apply_url"], "external": True})
+    if program.get("source_url") and program.get("source_url") != program.get("apply_url"):
+        links.append({"label": "Program source page", "href": program["source_url"], "external": True})
+
+    intro = (
+        f"Here's how to apply to **{program.get('name')}**"
+        + (f" as a {profile.get('sector', '').replace('_', ' ')} company in {profile.get('province')}" if profile else "")
+        + "."
+    )
+    if readiness_score >= 0.75:
+        intro += f" Your readiness score is **{int(readiness_score * 100)}%** — you're in good shape to start."
+    elif readiness_score > 0:
+        intro += f" Your readiness score is **{int(readiness_score * 100)}%** — address blockers before submitting."
+    else:
+        intro += " Complete your company profile for a personalized readiness check."
+
+    messages = [{"role": "assistant", "content": intro}]
+
+    if program.get("eligibility_narrative"):
+        messages.append({
+            "role": "assistant",
+            "content": f"**Eligibility:** {program['eligibility_narrative'][:800]}",
+        })
+    elif program.get("summary_1liner"):
+        messages.append({
+            "role": "assistant",
+            "content": program["summary_1liner"],
+        })
+
+    step_lines = "\n".join(f"{s['order']}. {s['detail']}" for s in steps[:6])
+    messages.append({
+        "role": "assistant",
+        "content": f"**Application steps:**\n{step_lines}",
+    })
+
+    doc_lines = "\n".join(
+        f"• **{d['name']}**{' (required)' if d['required'] else ''} — {d['detail']}"
+        for d in documents
+    )
+    messages.append({
+        "role": "assistant",
+        "content": f"**Documents to prepare:**\n{doc_lines}",
+    })
+
+    if blockers:
+        messages.append({
+            "role": "assistant",
+            "content": "**Blockers to resolve first:**\n" + "\n".join(f"• {b}" for b in blockers),
+        })
+    elif warnings:
+        messages.append({
+            "role": "assistant",
+            "content": "**Notes:**\n" + "\n".join(f"• {w}" for w in warnings[:4]),
+        })
+    else:
+        messages.append({
+            "role": "assistant",
+            "content": "No blockers detected. Review the official portal for any program-specific attestations before you submit.",
+        })
+
+    insight_texts = []
+    for ins in (insights or [])[:2]:
+        if isinstance(ins, dict) and ins.get("content"):
+            insight_texts.append(ins["content"])
+        elif isinstance(ins, str):
+            insight_texts.append(ins)
+    if insight_texts:
+        messages.append({
+            "role": "assistant",
+            "content": "**Award history insight:**\n" + "\n".join(f"• {t}" for t in insight_texts),
+        })
+
+    if program.get("stacking_notes"):
+        messages.append({
+            "role": "assistant",
+            "content": f"**Stacking:** {program['stacking_notes']}",
+        })
+
+    messages.append({
+        "role": "assistant",
+        "content": "Ask me anything below — deadlines, documents, eligibility, or what similar companies received.",
+    })
+
+    return {
+        "messages": messages,
+        "steps": steps,
+        "documents": documents,
+        "blockers": blockers,
+        "warnings": warnings,
+        "links": links,
+        "readiness_score": readiness_score,
+        "model": "heuristic",
+    }
+
+
+async def enhance_apply_guide_with_llm(
+    program: dict,
+    profile: Optional[dict],
+    readiness: Optional[dict],
+    base: dict,
+) -> dict:
+    """Optional LLM pass to add a concise personalized summary message."""
+    from llm import chat_json, llm_available
+
+    if not llm_available():
+        return base
+
+    context = {
+        "program": {
+            "name": program.get("name"),
+            "department": program.get("department"),
+            "deadline": program.get("deadline"),
+            "is_open": program.get("is_open"),
+            "apply_url": program.get("apply_url"),
+            "eligibility_narrative": (program.get("eligibility_narrative") or "")[:1200],
+            "application_steps": program.get("application_steps"),
+            "stacking_notes": program.get("stacking_notes"),
+        },
+        "profile": profile,
+        "readiness_score": base.get("readiness_score"),
+        "blockers": base.get("blockers"),
+        "documents": [d["name"] for d in base.get("documents", [])],
+    }
+    result = await chat_json([
+        {
+            "role": "system",
+            "content": (
+                "You are a Canadian grants application advisor. Return JSON: "
+                '{"summary": "2-3 sentence personalized how-to-apply overview", '
+                '"tip": "one actionable tip"}'
+            ),
+        },
+        {"role": "user", "content": json.dumps(context, default=str)},
+    ])
+    if result and result.get("summary"):
+        base["messages"].insert(1, {
+            "role": "assistant",
+            "content": result["summary"] + (f"\n\n**Tip:** {result['tip']}" if result.get("tip") else ""),
+        })
+        base["model"] = "gpt-4o-mini"
+    return base
+
+
+async def answer_apply_question(
+    program: dict,
+    profile: Optional[dict],
+    readiness: Optional[dict],
+    overlaps: list[dict],
+    question: str,
+    history: list[dict],
+) -> dict:
+    """Answer a follow-up question in the apply-guide chat."""
+    from llm import chat_json, llm_available
+
+    q = (question or "").strip().lower()
+    if not q:
+        return {"answer": "Please enter a question about how to apply.", "model": "heuristic"}
+
+    # Fast heuristic answers for common questions
+    if any(w in q for w in ("deadline", "due date", "when")):
+        dl = program.get("deadline")
+        ans = (
+            f"The listed deadline is **{dl}**."
+            if dl
+            else "No fixed deadline is on file — this may be a rolling intake. Confirm on the official portal."
+        )
+        return {"answer": ans, "model": "heuristic"}
+
+    if any(w in q for w in ("document", "paperwork", "need to submit", "prepare")):
+        docs = _default_apply_documents(program, profile)
+        lines = "\n".join(f"• {d['name']}: {d['detail']}" for d in docs)
+        return {"answer": f"**Documents to prepare:**\n{lines}", "model": "heuristic"}
+
+    if any(w in q for w in ("block", "eligible", "qualify", "requirement")):
+        guide = build_apply_guide(program, profile, readiness, overlaps)
+        if guide["blockers"]:
+            return {
+                "answer": "**Blockers:**\n" + "\n".join(f"• {b}" for b in guide["blockers"]),
+                "model": "heuristic",
+            }
+        if readiness:
+            failed = [i["label"] for i in readiness.get("items", []) if i.get("status") == "fail"]
+            if failed:
+                return {
+                    "answer": "**Eligibility gaps:**\n" + "\n".join(f"• {f}" for f in failed),
+                    "model": "heuristic",
+                }
+        return {
+            "answer": "No major blockers detected for your profile. Double-check the official program criteria before submitting.",
+            "model": "heuristic",
+        }
+
+    if any(w in q for w in ("apply", "portal", "website", "link", "where")):
+        url = program.get("apply_url")
+        if url:
+            return {
+                "answer": f"Apply through the official portal: {url}",
+                "model": "heuristic",
+                "link": {"label": "Open application portal", "href": url, "external": True},
+            }
+        return {
+            "answer": "No application URL is on file. Contact the administering department or search the program name on Canada.ca.",
+            "model": "heuristic",
+        }
+
+    if llm_available():
+        hist = history[-8:]
+        payload = {
+            "program_name": program.get("name"),
+            "department": program.get("department"),
+            "description": (program.get("description") or "")[:1500],
+            "eligibility": program.get("eligibility_narrative"),
+            "steps": program.get("application_steps"),
+            "profile": profile,
+            "readiness_score": (readiness or {}).get("readiness_score"),
+            "blockers": (readiness or {}).get("blockers"),
+        }
+        result = await chat_json([
+            {
+                "role": "system",
+                "content": (
+                    "Answer questions about applying to this Canadian government grant. "
+                    'Return JSON: {"answer": "markdown answer, concise"}'
+                ),
+            },
+            {"role": "user", "content": f"Program context:\n{json.dumps(payload, default=str)}"},
+            *[{"role": m["role"], "content": m["content"]} for m in hist if m.get("role") in ("user", "assistant")],
+            {"role": "user", "content": question},
+        ])
+        if result and result.get("answer"):
+            return {"answer": result["answer"], "model": "gpt-4o-mini"}
+
+    return {
+        "answer": (
+            "I can help with deadlines, required documents, eligibility blockers, and where to apply. "
+            "Try asking one of those, or open the official application portal for program-specific forms."
+        ),
+        "model": "heuristic",
     }
 
 

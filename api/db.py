@@ -21,7 +21,10 @@ from dotenv import load_dotenv
 
 from features import (
     answer_grant_question,
+    answer_apply_question,
     browse_programs,
+    build_apply_guide,
+    enhance_apply_guide_with_llm,
     build_recipient_summaries,
     compute_alerts,
     enrich_program,
@@ -338,16 +341,44 @@ class JsonRepository:
         )
 
     async def program_readiness(self, profile: dict, program_id: str) -> Optional[dict]:
-        program = self.programs_by_id.get(program_id)
+        program = self.programs_by_id.get(str(program_id))
         if not program:
             return None
         return readiness_checklist(profile, program)
 
     async def program_overlap(self, profile: dict, program_id: str) -> list[dict]:
-        program = self.programs_by_id.get(program_id)
+        program = self.programs_by_id.get(str(program_id))
         if not program:
             return []
         return overlap_flags(profile, program, self.programs)
+
+    async def program_apply_guide(
+        self, program_id: str, profile: Optional[dict]
+    ) -> Optional[dict]:
+        program = self.programs_by_id.get(str(program_id))
+        if not program:
+            return None
+        readiness = readiness_checklist(profile, program) if profile else None
+        overlaps = overlap_flags(profile, program, self.programs) if profile else []
+        insights = self.insights_by_program.get(str(program_id), [])
+        guide = build_apply_guide(program, profile, readiness, overlaps, insights)
+        return await enhance_apply_guide_with_llm(program, profile, readiness, guide)
+
+    async def program_apply_chat(
+        self,
+        program_id: str,
+        profile: Optional[dict],
+        question: str,
+        history: list[dict],
+    ) -> Optional[dict]:
+        program = self.programs_by_id.get(str(program_id))
+        if not program:
+            return None
+        readiness = readiness_checklist(profile, program) if profile else None
+        overlaps = overlap_flags(profile, program, self.programs) if profile else []
+        return await answer_apply_question(
+            program, profile, readiness, overlaps, question, history
+        )
 
     async def get_watchlist(self, session_id: str) -> dict:
         items = [w for w in self.watchlist if w["session_id"] == session_id]
@@ -765,17 +796,47 @@ class PgRepository:
 
     async def program_readiness(self, profile: dict, program_id: str) -> Optional[dict]:
         programs = await self._programs_by_id()
-        program = programs.get(program_id)
+        program = programs.get(str(program_id))
         if not program:
             return None
         return readiness_checklist(profile, program)
 
     async def program_overlap(self, profile: dict, program_id: str) -> list[dict]:
         programs = await self._programs_by_id()
-        program = programs.get(program_id)
+        program = programs.get(str(program_id))
         if not program:
             return []
         return overlap_flags(profile, program, list(programs.values()))
+
+    async def program_apply_guide(
+        self, program_id: str, profile: Optional[dict]
+    ) -> Optional[dict]:
+        detail = await self.program_detail(program_id, limit=0, offset=0)
+        program = detail.get("program")
+        if not program:
+            return None
+        readiness = await self.program_readiness(profile, program_id) if profile else None
+        overlaps = await self.program_overlap(profile, program_id) if profile else []
+        insights = detail.get("insights") or []
+        guide = build_apply_guide(program, profile, readiness, overlaps, insights)
+        return await enhance_apply_guide_with_llm(program, profile, readiness, guide)
+
+    async def program_apply_chat(
+        self,
+        program_id: str,
+        profile: Optional[dict],
+        question: str,
+        history: list[dict],
+    ) -> Optional[dict]:
+        detail = await self.program_detail(program_id, limit=0, offset=0)
+        program = detail.get("program")
+        if not program:
+            return None
+        readiness = await self.program_readiness(profile, program_id) if profile else None
+        overlaps = await self.program_overlap(profile, program_id) if profile else []
+        return await answer_apply_question(
+            program, profile, readiness, overlaps, question, history
+        )
 
     async def get_watchlist(self, session_id: str) -> dict:
         rows = await self.pool.fetch(

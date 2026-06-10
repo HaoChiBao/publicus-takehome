@@ -24,6 +24,11 @@ import {
   normalizeProgram,
   readCachedProgram,
 } from "@/lib/programCache";
+import {
+  ApplyGuidePanel,
+  ApplyGuideTrigger,
+  useApplyGuide,
+} from "@/components/ApplyGuideChat";
 import ReadinessChecklist from "@/components/ReadinessChecklist";
 import RecipientTable from "@/components/RecipientTable";
 import WatchlistButton from "@/components/WatchlistButton";
@@ -50,6 +55,7 @@ export default function ProgramDetailPage() {
   const [overlapFlags, setOverlapFlags] = useState<OverlapFlag[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const applyGuide = useApplyGuide(programId);
 
   useEffect(() => {
     if (!programId) return;
@@ -215,6 +221,10 @@ export default function ProgramDetailPage() {
               )}
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <ApplyGuideTrigger
+                onClick={applyGuide.startGuide}
+                loading={applyGuide.loading}
+              />
               <WatchlistButton entityType="program" entityId={programId} />
               {program.apply_url && (
                 <a
@@ -332,6 +342,10 @@ export default function ProgramDetailPage() {
             )}
         </CardContent>
       </Card>
+
+      {program && (
+        <ApplyGuidePanel programName={program.name} {...applyGuide} />
+      )}
 
       {insights.length > 0 && (
         <div className="space-y-2">
